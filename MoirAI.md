@@ -59,9 +59,10 @@ MoirAI also includes:
 | **MoirAI-Q0.5B** |     24 |     896 |               4 864 |                  **4** |                           8 |
 | **MoirAI-Q1.5B** |     28 |   1 536 |               8 960 |                  **6** |                           8 |
 
+* The intent is to use MoirAI-Q0.5B during development and validation of processes and code, and then train MoirAI-Q1.5B using those validated processes and code.
+* HRM clusters scale with model size (Q0.5B → 4 clusters, Q1.5B → 6 clusters) to keep total HRM parameters ≳ ~¼ of the FFN parameter budget.
 * “Family” = donor lineage; default: Qwen.
   Optional: Mamba mixers as a second family.
-* HRM clusters scale with model size (Q0.5B → 4 clusters, Q1.5B → 6 clusters) to keep total HRM parameters ≳ ~¼ of the FFN parameter budget.
 
 ---
 
