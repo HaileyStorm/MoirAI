@@ -96,6 +96,67 @@ We select a **subset of donor FFN layers** (`capture_layers`) to build one **glo
 
 All trunk references (attention backends, S-REG-LID, UMoE-lite taps) use **1-based trunk indexing** over the full 24/28 layers. A tap list (e.g., `[6,12,18,24]`) is a **subset** of those indices; no re-indexing occurs even if the donor capture set changes.
 
+### 2.2 HRM band widths & heterogeneous tiers (per variant)
+
+This section pins down **band widths**, the **five‑ratio tiering** (with rounding policy in §6.1.0), **per‑cluster multiplicities**, and **intended pick‑rate biases** for each model.
+
+> **Rounding & recording** follow §6.1.0: snap near powers‑of‑two, otherwise even/64‑aligned; enforce minimum expert widths; and **record** `ratio = rounded_width / band_width` (per band). All “rounded widths” below already reflect those rules.
+
+#### 2.2.1 **MoirAI‑Q0.5B** (high‑granularity)
+
+* **Band widths:** `d_L = 1920`, `d_M = 2880`  (keeps `d_M = 1.5·d_L`)
+
+* **Ratios (five)** → **rounded widths (L / M):**
+
+  * **0.2667× (4/15)** → **512 / 768**  (512 is 2^9; 768 is 64‑aligned)
+  * **0.50×** → **960 / 1440**
+  * **0.75×** → **1440 / 2160**
+  * **1.00×** → **1920 / 2880**
+  * **1.25× (escape)** → **2432 / 3584**  (64‑aligned within ≤2% of 1.25×)
+
+* **Counts per cluster (capacity‑preserving):**
+
+  * **HRM‑L (8 total):** { **0.2667×: 4**, 0.50×: 1, 0.75×: 1, 1.00×: 1, 1.25×: 1 }
+  * **HRM‑M (5 total):** { **0.2667×: 1**, 0.50×: 1, 0.75×: 1, 1.00×: 1, 1.25×: 1 }
+  * **Clusters:** **4**.
+
+* **Target pick rates (steady state):**
+
+  * **L:** ~**88–92%** to **0.2667×**, **5–8%** to **0.50×**, remainder thin across larger tiers.
+  * **M:** ~**85–90%** to **0.2667×**, remainder across larger tiers.
+
+* **Granularity** (define **g = 1/ratio**; larger g ⇒ finer allocation):
+
+  * 0.2667× → **3.75×**, 0.50× → **2.00×**, 0.75× → **1.33×**, 1.00× → **1.00×**, 1.25× → **0.80×**.
+  * **Average granularity (rounded widths): ~**3.5**.
+
+#### 2.2.2 **MoirAI‑Q1.5B** (budget‑adjusted HRM ≈ **2.36B** params)
+
+* **Band widths:** `d_L = 3072`, `d_M = 4096`  (reduced **M** vs 1.5× to contain quadratic cost while preserving compile invariants)
+
+* **Ratios (five)** → **rounded widths (L / M):**
+
+  * **0.3333× (1/3)** → **1024 / 1344**  (L snaps to 1024; M aligns to 1344)
+  * **0.50×** → **1536 / 2048**
+  * **0.75×** → **2304 / 3072**
+  * **1.00×** → **3072 / 4096**
+  * **1.20× (escape)** → **3712 / 4928**  (64‑aligned; >1.0 headroom)
+
+* **Counts per cluster:**
+
+  * **HRM‑L (6 total):** { **0.3333×: 2**, 0.50×: 1, 0.75×: 1, 1.00×: 1, 1.20×: 1 }
+  * **HRM‑M (5 total):** { 0.3333×: 1, 0.50×: 1, 0.75×: 1, 1.00×: 1, 1.20×: 1 }
+  * **Clusters:** **6**.
+
+* **Target pick rates (steady state):**
+
+  * **L:** **≥90%** to **0.3333×**; escape 1.20× is rare.
+  * **M:** **≥88%** to **0.3333×**; remainder across larger tiers.
+
+* **Granularity:** 0.3333× → **3.00×**, 0.50× → **2.00×**, 0.75× → **1.33×**, 1.00× → **1.00×**, 1.20× → **0.83×**.
+
+  * **Average granularity (rounded widths): ~**3.0–3.1**.
+
 ---
 
 ## 3) Data & representation
@@ -299,11 +360,24 @@ When innovation-based router bias is enabled (see §7.2.1), we add a small bias 
 
 ### 5.2 Widths & iteration caps
 
-* **HRM-L:** width `d`, iteration cap `k ≤ 4`.
-* **HRM-M:** width `dₘ = 1.5·d`, iteration cap `≤ 2`.
-* **HRM-G:** width `2·d`, one update per outer step.
+We parameterize HRM widths by **band** and **variant**.
 
-We expose per-step budgets and halting style via THPL (see §9). THPL also provides hard caps `outer_max`, `l_max`, and `m_max` that gate allowed loop counts for that task.
+* Let **d_L** and **d_M** be the HRM‑L and HRM‑M band widths for the chosen model variant (see **§2.2**).
+* **HRM‑G** width is **2·d_L** (unchanged).
+* Iteration caps are unchanged; only widths are variant‑specific.
+
+**Iteration caps (unchanged):**
+
+* **HRM‑L:** iteration cap `k ≤ 4`.
+* **HRM‑M:** iteration cap `U ≤ 2`.
+* **HRM‑G:** one update per outer step.
+
+**Routing:** still **top‑1** everywhere (clusters, HRM‑L/M experts, FFN family→cluster→expert).
+
+**Notes.**
+
+* For **Q0.5B**, we keep `d_M = 1.5·d_L`.
+* For **Q1.5B**, we **override** `d_M` (not 1.5×) to reduce quadratic cost; see **§2.2**.
 
 ### 5.3 Exact loop inside a chosen cluster
 
@@ -478,91 +552,103 @@ Both use **top-1 routing** (capacity factor 1.25). Both use Switch-style load ba
 
 Each HRM cluster has its own **HRM-L** and **HRM-M** expert banks. Banks are **not shared across clusters**.
 
-#### 6.1.1 HRM-L (operates on v0; state width = `d`)
+### 6.1.0 HRM width rounding & recording policy
 
-**Expert bank per cluster (top-1):**
-Tiers and counts per cluster:
+**Purpose.** Hardware‑friendly expert widths, static shapes, and reproducible configs.
 
-*   **0.50×d (2)**
-*   **0.75×d (2)**
-*   **1.00×d (2)**
-*   **1.50×d (1)**
-    → **7 experts/cluster total.**
+**Apply to** all HRM‑L/M experts: `raw_width = ratio × band_width`.
 
-Each expert is wrapped with per-expert adapters:
+**Rounding rules (in order):**
 
-*   `In: d → d_e`
-*   Core 2-matrix MLP at width `d_e`
-*   `Out: d_e → d`
-    And is used as a residual around the GRU-L update.
+1. If `raw_width` is within **±5%** of a power‑of‑two, **snap** to that power‑of‑two.
+2. Otherwise, **round to nearest even**; prefer a multiple of **64** if the change is **≤2%**.
+3. Enforce **minimum expert width**: **0.5B ≥ 512**, **1.5B ≥ 1024**.
+4. **Record** in configs: `ratio_recorded = rounded_width / band_width` (so the recorded ratio can differ slightly per band).
 
-**Shared fixed path (weight-tied across clusters):**
-We define `FixedL_shared: d → d` (width = 1.0×d) once globally.
-Each cluster `c` applies:
+**Reference implementation:**
 
-```text
-hL ← hL + w_fixL_c · FixedL_shared(hL_prev)
-w_fixL_c = a_c · σ(b_c)   # two learned scalars per cluster
-a_c init = 0.4, b_c init = 0
+```python
+def round_width(raw, min_width, pow2_tol=0.05, align=64, align_tol=0.02):
+    raw = max(raw, min_width)
+    p = 2**round(log2(raw))
+    if abs(raw - p) / raw <= pow2_tol:
+        return int(p)
+    a = round(raw / align) * align
+    if abs(raw - a) / raw <= align_tol:
+        return int(a)
+    return int(2 * round(raw / 2))
 ```
 
-We anneal `a_c → 0` over Milestone M4 unless we “repurpose” instead of removing (see below).
+### 6.1.1 HRM‑L (operates on v0; state width = d_L)
 
-#### 6.1.2 HRM-M (operates on v1; state width = `d_m = 1.5·d`)
+**Expert bank per cluster (top‑1): five size tiers + escape; multiplicities differ by variant.**
+Widths are computed from **§2.2** ratios using **§6.1.0** rounding.
 
-**Expert bank per cluster (top-1):**
-Tiers and counts per cluster:
+* **Q0.5B (d_L = 1920)** — **8 experts/cluster:**
 
-*   **1.00×d (1)**
-*   **1.50×d (1)**
-*   **2.00×d (1)**
-    → **3 experts/cluster total.**
+  * **0.2667×:** **×4**
+  * **0.50×:** ×1
+  * **0.75×:** ×1
+  * **1.00×:** ×1
+  * **1.25× (escape):** ×1
 
-Adapters (relative to `d_m`):
+* **Q1.5B (d_L = 3072)** — **6 experts/cluster:**
 
-*   `In: d_m → d_e`
-*   Core 2-matrix MLP at width `d_e`
-*   `Out: d_e → d_m`
-    Residual around GRU-M.
+  * **0.3333×:** **×2**
+  * **0.50×:** ×1
+  * **0.75×:** ×1
+  * **1.00×:** ×1
+  * **1.20× (escape):** ×1
 
-**Shared fixed path (weight-tied across clusters):**
-`FixedM_shared: d_m → d_m` (width = 1.5×d = d_m).
-Each cluster `c` applies:
+**Per‑expert wrapper:**
 
-```text
-hM ← hM + w_fixM_c · FixedM_shared(hM_prev)
-w_fixM_c = a'_c · σ(b'_c)
-a'_c init = 0.4, b'_c init = 0
-```
+* `In: d_L → d_e` → 2‑matrix MLP @ `d_e` → `Out: d_e → d_L`, used as a residual around GRU‑L.
 
-Anneal `a'_c` similarly to `a_c`.
+**Shared fixed path (slower anneal):**
 
-#### 6.1.3 Routing, stability, and curricula (HRM-L and HRM-M)
+* `FixedL_shared: d_L → d_L` (width = **1.0×d_L**, tied across clusters).
+* Each cluster `c` applies `hL ← hL + w_fixL_c · FixedL_shared(hL_prev)`, with the existing scalar gate param (`a_c, b_c`).
+* **Anneal slightly slower during warm‑start** to stabilize wider states; removal/repurpose policy remains per §6.1.4.
 
-*   Always **top-1 expert** with capacity factor 1.25.
-*   Stabilizers:
-    *   **Switch-LBL α** starts 0.02 → 0.01 → 0.005 (warm / main / late).
-    *   **z-loss = 1e-3**.
-    *   Router temperature τ anneals 1.2 → 1.0.
-    *   Router logit noise anneals 1.0 → 0.2.
-*   **Compute prior:** we subtract `κ·(d_e/d − 1)` from router logits so that very large experts “pay rent.”
-    *   κ_L = 0.20 for HRM-L
-    *   κ_M = 0.10 for HRM-M
-*   **Size curricula:** unlock larger/smaller experts gradually.
+### 6.1.2 HRM‑M (operates on v1; state width = d_M)
 
-For HRM-L:
+**Expert bank per cluster (top‑1): five size tiers + escape; one of each per cluster (both variants).**
+Widths from **§2.2** via **§6.1.0**.
 
-*   0–5% tokens: enable only **1.0×d** experts.
-*   5–10% tokens: also allow **0.75×d** and **1.50×d** experts.
-*   ≥10% tokens: also allow **0.50×d** experts.
+* **Q0.5B (d_M = 2880) — 5 experts/cluster:** { 0.2667×, 0.50×, 0.75×, 1.00×, 1.25× }.
+* **Q1.5B (d_M = 4096) — 5 experts/cluster:** { 0.3333×, 0.50×, 0.75×, 1.00×, 1.20× }.
 
-For HRM-M:
+**Per‑expert wrapper:**
 
-*   0–5% tokens: enable only **1.5×d (= d_m)** experts.
-*   5–10% tokens: also allow **1.0×d**.
-*   ≥10% tokens: also allow **2.0×d**.
-*   **Tier-level Expert-Choice fallback:**
-    If a specific size-tier starves or dominates (overflow>5% or dead>10% persists >1k steps), we can temporarily flip *that tier only* to Expert-Choice routing (capacity-distributed) while keeping top-1 for other tiers.
+* `In: d_M → d_e` → 2‑matrix MLP @ `d_e` → `Out: d_e → d_M`, residual around GRU‑M.
+
+**Shared fixed path (slower anneal):**
+
+* `FixedM_shared: d_M → d_M` (width = **1.0×d_L = d_M** when `d_M=1.5·d_L`; for Q1.5B we keep `FixedM_shared` at **d_M**).
+* Per‑cluster scalar gate `w_fixM_c` as before; **anneal slightly slower during warm‑start**.
+
+### 6.1.3 Routing, stability, and curricula (HRM‑L/M)
+
+* **Routing:** **top‑1** expert with capacity factor **1.25**.
+
+* **Stabilizers:** Switch‑LBL α: **0.02 → 0.01 → 0.005** (warm / main / late); **z‑loss = 1e‑3**; router τ: **1.2 → 1.0**; router logit noise: **1.0 → 0.2**.
+
+* **Compute priors (raised to bias small tiers):**
+
+  * **κ_L = 0.34** (range 0.33–0.35 acceptable),
+  * **κ_M = 0.25**.
+  * Subtract `κ·(d_e/d_band − 1)` from router logits.
+
+* **Size curricula (small → large unlock):**
+
+  * Early enable only the **smallest tier** (0.2667× on Q0.5B; 0.3333× on Q1.5B).
+  * Then enable 0.50× and 0.75×.
+  * Then 1.00×; keep **escape (>1.0)** last and **rare**.
+  * Maintain **tier‑level Expert‑Choice fallback** when starvation/overflow persists (>1k steps) without changing global top‑1 policy.
+
+* **Pick‑rate intent (steady state):** see **§2.2**; overwhelming mass to the smallest tier in both bands.
+
+* **Halting / early stabilization:** keep halter behavior; allow **+1 outer step** temporarily if small‑tier dominance causes transient overflow during warm‑start; revert once routers settle.
 
 #### 6.1.4 Remove vs repurpose shared fixed paths
 
@@ -586,6 +672,25 @@ Cluster scaling per model variant:
 *   **Q1.5B → 6 clusters**
 
 We size clusters and fixed paths so HRM total params sit at ≳~¼ of FFN bank parameters.
+
+### 6.1.5 HRM parameter budget (HRM‑only; includes shared fixed paths)
+
+**Per‑expert model:** `P_expert ≈ 2·d_band·d_e + 2·d_e²`
+**Shared fixed paths:** `P_fixed ≈ 2·d_L² + 2·d_M²`
+
+**Totals (for HRM only; all clusters; rounded):**
+
+* **Q0.5B (4 clusters):** **New ≈ 0.747B**, **baseline ≈ 0.255B** → **Δ ≈ +0.492B**.
+* **Q1.5B (6 clusters):** **New ≈ 2.355B**, **baseline ≈ 1.120B** → **Δ ≈ +1.235B**.
+
+Trimming multiplicity on larger tiers and using **64‑aligned escape widths** caps growth while achieving granularity targets (see §2.2).
+
+### 6.1.6 Why this works (HRM sizes & rounding)
+
+* **Small‑tier dominance** via power‑of‑two / 64‑aligned minima lifts average **granularity** (3.5 on Q0.5B; ~3.0–3.1 on Q1.5B) without exploding parameters.
+* **Five ratios per band** preserve routing flexibility; a **rare escape tier (>1.0)** gives headroom without dominating compute.
+* **Budgeted Q1.5B** lowers **M** band width (4096) and trims **L** multiplicity, cutting quadratic cost while preserving compile invariants and meeting **≥3× granularity**.
+* The rounding policy yields **hardware‑friendly** dimensions and **reproducible configs** (`ratio = rounded_width / band_width`), and pre‑tracing all shapes keeps **compile warm‑up** complete and fast.
 
 ### 6.2 FFN knowledge experts (transplanted)
 
@@ -1372,16 +1477,20 @@ THPL enforces a consistent byte policy for H-Net:
 
 Mixed batches are fine; each sample carries its own header; H-Net respects header boundaries.
 
-### 9.6 Compile Warm-up Driver ("Path Exciter")
+### 9.6 Compile warm‑up driver ("Path Exciter")
 
-To avoid runtime compilation lag, we pre-trace all likely graph variants before training begins. A warm-up driver constructs synthetic batches that exercise different paths based on THPL presets:
+To avoid first‑use stalls and preserve `torch.compile(dynamic=false)`, **pre‑trace** every expert **shape** and all verify‑bump buckets before training:
 
-*   `nl_chat`, `code_chat`, `sudoku_9x9`, `arc_30x30`, one with `bptt=1`.
-*   For DSA layers, issue short forwards that hit all power-of-two K values in `[k_min, verify_bump_max_k]`.
-*   If UMoE-lite is enabled, include a case that routes to a non-fixed expert.
-*   Run one micro-batch that forces a verify path trigger.
+1. **HRM expert shapes (all clusters, both bands):** route **once to each ratio** present for the active model.
 
-This is run once after model init and `torch.compile`, before the first real batch.
+   * **Q0.5B:** `{0.2667×, 0.50×, 0.75×, 1.00×, 1.25×}` for **L** and **M** (rounded per §6.1.0; widths in §2.2).
+   * **Q1.5B:** `{0.3333×, 0.50×, 0.75×, 1.00×, 1.20×}` for **L** and **M** (rounded per §6.1.0; widths in §2.2).
+2. **FFN bank:** for each **family→cluster**, route once to **each carved expert** and once to the **fixed** expert.
+3. **DSA verify‑bump K‑buckets:** issue short forwards that hit **all powers‑of‑two** K in `[k_min, verify_bump_max_k]` per long‑context layer (see §10.1.4).
+4. **THPL presets & verify path:** one micro‑batch per header preset (nl_chat, code_chat, sudoku_9x9, arc_30x30, bptt_demo), plus a case that **triggers verify**.
+5. **Micro‑batches:** keep tiny; shapes static; routing **top‑1**.
+
+The warm‑up driver logs coverage and must report ≥95% of intended paths exercised before main training starts.
 
 ### 9.7 Integration and Tests
 
@@ -2154,8 +2263,9 @@ This list represents the core engineering tickets to be implemented.
 
 ```yaml
 model:
+  # See §2 for variants.
   d_model: 896
-  hrm_clusters: 4
+  hrm_clusters: 4            # Q0.5B; use 6 for Q1.5B
   ffn_families: ["qwen"]
 
 hnet:
@@ -2180,15 +2290,21 @@ hnet:
     trigger: {innov_pctl: 97, proto_sim_max: 0.15}
     window_tokens: 1024
 
-hrm:
-  L: { width: d,     iter_cap: 4,  micro_experts: false }
-  M: { width: 1.5*d, iter_cap: 2 }
-  G: { width: 2.0*d }
+# ---------------- HRM: band widths + iteration caps ----------------
+# Select ONE of the following per run (comment the other).
 
+# --- Q0.5B HRM bands (high granularity) ---
+hrm:
+  bands:
+    L_width: 1920
+    M_width: 2880
+    G_width: 3840         # = 2 * L_width
+  L: { iter_cap: 4 }
+  M: { iter_cap: 2 }
+  G: { iter_cap: 1 }
   broadcast:
     film_groups: 8
-    innovation_gate: {enable: true, w: 0.5}
-
+    innovation_gate: { enable: true, w: 0.5 }
   halting:
     type: mlp
     mlp_widen: 4
@@ -2197,16 +2313,25 @@ hrm:
     one_step_gradient: false
     use_innovation: true
 
-  caps_from_thpl: true
-
-  # ---- S-REG hooks for HRM bands ----
-  scales:
-    apply_attn:      true    # scale HRM L/M attention residuals
-    apply_L_expert:  true    # scale HRM-L expert residuals
-    apply_M_expert:  true    # scale HRM-M expert residuals
-    apply_L_fixed:   true    # multiplies existing w_fixL gate
-    apply_M_fixed:   true    # multiplies existing w_fixM gate
-    apply_film:      true    # scales FiLM (γ,β) magnitude
+# # --- Q1.5B HRM bands (budget-adjusted) ---
+# hrm:
+#   bands:
+#     L_width: 3072
+#     M_width: 4096        # override (not 1.5×) to reduce quadratic cost
+#     G_width: 6144        # = 2 * L_width
+#   L: { iter_cap: 4 }
+#   M: { iter_cap: 2 }
+#   G: { iter_cap: 1 }
+#   broadcast:
+#     film_groups: 8
+#     innovation_gate: { enable: true, w: 0.5 }
+#   halting:
+#     type: mlp
+#     mlp_widen: 4
+#     step_penalty_target: 0.01
+#     cosine_safety: { enable_if_outer_cap: 8, epsilon: 0.05, gamma: 5.0 }
+#     one_step_gradient: false
+#     use_innovation: true
 
 hrm_experts:
   compute_prior_kappa: { L: 0.20, M: 0.10 }
@@ -2226,9 +2351,64 @@ hrm_experts:
     bias_from_innovation:
       hrm_cluster: {enable: true, coef: 0.1}
       ffn_mor:     {enable: true, coef: 0.1}
+  rounding_policy:
+    pow2_snap_tol: 0.05        # ±5% → snap to power-of-two
+    align: 64
+    align_tol: 0.02            # ≤2% → prefer 64-aligned
+    min_width:
+      q05b: 512
+      q15b: 1024
+    record_ratio_as: "rounded_width / band_width"
   # ---- S-REG acknowledgment for HRM experts ----
   scales:
     compute_prior_unchanged: true   # κ unchanged; S-REG orthogonal
+  
+  # ---------------- HRM-L/M expert tiers & multiplicities -------------
+  # (ratios are pre-round; actual widths come from rounding_policy + bands)
+  # Comment unused model settings
+  L_per_cluster:
+    # Q0.5B: 8 per cluster
+    ratios: [0.2667, 0.50, 0.75, 1.00, 1.25]
+    counts: { "0.2667": 4, "0.50": 1, "0.75": 1, "1.00": 1, "1.25": 1 }
+    # Q1.5B: 6 per cluster
+    #ratios: [0.3333, 0.50, 0.75, 1.00, 1.20]
+    #counts: { "0.3333": 2, "0.50": 1, "0.75": 1, "1.00": 1, "1.20": 1 }
+    fixed:
+      mult: 1.00
+      weight: "0.4->0.0"       # anneal slightly slower during warm-start
+
+  M_per_cluster:
+    # Both variants: 5 per cluster, one of each ratio in the set for that variant
+    # Comment unused model settings
+    #q05b:
+    ratios: [0.2667, 0.50, 0.75, 1.00, 1.25]
+    counts: { "0.2667": 1, "0.50": 1, "0.75": 1, "1.00": 1, "1.25": 1 }
+    #q15b:
+    #ratios: [0.3333, 0.50, 0.75, 1.00, 1.20]
+    #counts: { "0.3333": 1, "0.50": 1, "0.75": 1, "1.00": 1, "1.20": 1 }
+    fixed:
+      mult: 1.00               # fixed path runs at band width
+      weight: "0.4->0.0"       # anneal slightly slower during warm-start
+
+  routing:
+    topk_expert: 1
+    capacity_factor: 1.25
+    switch_lbl_alpha: [0.02, 0.01, 0.005]
+    z_loss: 1.0e-3
+    compute_prior_kappa: { L: 0.34, M: 0.25 }   # raised to bias small tiers
+    curricula:
+      policy: "small_to_large"
+      unlock:
+        - { at_frac_tokens: 0.00, tiers: ["smallest"] }
+        - { at_frac_tokens: 0.05, tiers: ["0.50","0.75"] }
+        - { at_frac_tokens: 0.10, tiers: ["1.00"] }
+        - { at_frac_tokens: 0.15, tiers: [">1.0_escape"] }
+    tier_level_ec_fallback:
+      enable: true
+      triggers: { overflow_gt: 0.05, dead_gt: 0.10, min_steps: 1000 }
+    bias_from_innovation:
+      hrm_cluster: { enable: true, coef: 0.1 }
+      ffn_mor:     { enable: true, coef: 0.1 }
 
 ffn_bank:
   families:
@@ -2362,9 +2542,13 @@ thpl:
 compile_warmup:
   path_exciter:
     enable: true
+    hrm_ratios:
+      q05b: [0.2667, 0.50, 0.75, 1.00, 1.25]
+      q15b: [0.3333, 0.50, 0.75, 1.00, 1.20]
+    cover_bands: ["L","M"]        # route once to each ratio per band per cluster
+    cover_dsa_powers_of_two: true  # see §10.1.4
     cover_headers: ["nl_chat","code_chat","sudoku_9x9","arc_30x30","bptt_demo"]
-    cover_dsa_powers_of_two: true
-    cover_umoe_layers: true
+    force_verify_case: true
 
 config_guards:
   - rule: "ssa_on_band_implies_not_sigmoid"
@@ -2526,6 +2710,10 @@ training:
   umoe_warmup_steps: 30000         # freeze shared experts during warm-up
   unfreeze_core_lr_mult: 0.1
 ```
+
+> **Monitoring intents (informational):**
+> Q0.5B: L ~88–92% mass on 0.2667×; M ~85–90% on 0.2667×.
+> Q1.5B: L ≥90% on 0.3333×; M ≥88% on 0.3333×. Escape tiers remain rare.
 
 ---
 
