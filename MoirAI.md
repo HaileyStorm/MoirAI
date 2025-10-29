@@ -50,6 +50,23 @@ MoirAI also includes:
 * **Attention backends and stabilization**: multiple interchangeable attention variants (standard dot-product, adaptive/uncertainty-aware, head-gated, sigmoid, selective temperature, etc.) plus safeguards against attention sink and activation spikes.
 * **Long-context strategy**: External Segment Encoder (ESE) to compress long documents into cached high-level latents; periodic or Power/DSA-style attention for scalable global mixing; hybrid positional schemes; static-shape routing with top-k=1 to preserve compile-friendliness.
 
+### 1.5 Learned Residual Scales (S-REG)
+
+**What.** A compile-safe **Scale Registry (S-REG)** adds non-negative learned scalars that modulate residual contributions **per module type** (attention, HRM experts, fixed paths, donor FFN retrieval, FiLM broadcast, UMoE-lite taps) and **per layer/band** (L/M/G, trunk attention, attention taps). For any residual path `Δ(·)` we apply:
+
+```text
+y = x + s_type · s_layer · DropPath(Δ(x))         # s_type ≥ 0, s_layer ≥ 0 (learned; softplus-param)
+```
+
+**Why.**
+(1) Stabilizes early training and donor-FFN splice-in; (2) reduces attention sink by controlling post-mix magnitude; (3) prevents HRM expert over-dominance; (4) provides clean attribution telemetry (“who did the work?”) for verify/abstain and fixed-path repurposing; (5) costs ~0 params relative to model size and preserves compile invariants.
+
+**Parameterization & Safety.**
+Scales are parameterized as `s = softplus(θ)` with optional soft barrier `s ≤ s_max` via a tiny quadratic penalty (see §11.6). Initial values are conservative (see §16 (REPLACED)). GRUs remain unscaled; only **residual contributions** into GRU inputs or output heads are scaled. No dynamic control flow, no shape changes, and no changes to top-k dispatch.
+
+**Placement (high-level).**
+S-REG multiplies residuals from: HRM-L/M attention, HRM-L/M top-1 experts, HRM fixed paths, donor FFN retrieval into G, FiLM broadcast magnitude `(γ,β)`, trunk attention residuals (all backends), and optional UMoE-lite taps.
+
 ---
 
 ## 2) Model variants (trunks trained from scratch; Qwen-aligned dims) [^14][^15]
@@ -59,10 +76,25 @@ MoirAI also includes:
 | **MoirAI-Q0.5B** |     24 |     896 |               4 864 |                  **4** |                           8 |
 | **MoirAI-Q1.5B** |     28 |   1 536 |               8 960 |                  **6** |                           8 |
 
-* The intent is to use MoirAI-Q0.5B during development and validation of processes and code, and then train MoirAI-Q1.5B using those validated processes and code.
+* The intent is to use MoirAI-Q0.5B during development and validation of processes and code, and then train MoirAI-Q1.5B (possibily also transplanting Mamba mixers) using those validated processes and code.
 * HRM clusters scale with model size (Q0.5B → 4 clusters, Q1.5B → 6 clusters) to keep total HRM parameters ≳ ~¼ of the FFN parameter budget.
 * “Family” = donor lineage; default: Qwen.
   Optional: Mamba mixers as a second family.
+
+### 2.1 Trunk depth vs donor capture set (clarification & indexing)
+
+**Trunk depth is fixed by variant.**
+
+* **Q0.5B:** 24 trunk layers (see §7.1.3).
+* **Q1.5B:** 28 trunk layers (see §7.1.2).
+
+**Donor capture set is separate.**
+
+We select a **subset of donor FFN layers** (`capture_layers`) to build one **global, flattened** family bank (§6.2.1). This does **not** remove trunk layers and **does not** renumber them.
+
+**Indexing and taps.**
+
+All trunk references (attention backends, S-REG-LID, UMoE-lite taps) use **1-based trunk indexing** over the full 24/28 layers. A tap list (e.g., `[6,12,18,24]`) is a **subset** of those indices; no re-indexing occurs even if the donor capture set changes.
 
 ---
 
@@ -298,25 +330,35 @@ hM_u  = GRU_M(hM̃_u, ctxM)
 hM_u += w_fixM · FixedM(hM_{u-1})                   # shared fixed HRM-M path with per-cluster scalar gate
 ```
 
-**Global update and FFN retrieval, then broadcast**
-
 ```text
 poolM = Pool(hM_U)
 poolL = Pool(hL_k)
 xG    = concat(poolL, poolM, CLS(v2))
 
 hG'   = GRU_G(hG, xG)
-q     = Wq · hG'                                    # query vector into FFN knowledge bank
 
-# Family→cluster→expert retrieval (see §6):
-y_FFN = RetrieveFFN(q, v0, high_token_prior=v2)     # top-1 routed FFN expert + optional fixed expert residual
+# Query FFN knowledge bank
+q     = Wq · hG'                                        # [d]
+y_FFN = RetrieveFFN(q, v0, high_token_prior=v2)         # (family→cluster→expert; top-1)
 
-hG''  = G_update(hG', y_FFN)                        # small MLP / GRU integration
+# S-REG: scale routed FFN residual before integration
+y_FFN = (s_type.ffn_retrieve · s_layer.G) · y_FFN
 
-(γ,β)  = FiLM(hG'')                                 # FiLM broadcast (see §5.5)
+# Integrate and produce FiLM
+hG''  = G_update(hG', y_FFN)                            # small MLP / GRU integration
+
+(γ,β) = FiLM(hG'')                                      # produce FiLM parameters
+(γ,β) = (s_type.film · s_layer.L) · (γ,β)               # S-REG: scale broadcast magnitude
+
+# Apply FiLM and decode bytes
 hL_mod = (1 + γ) ⊙ hL_k + β
 logits = ByteHead(hL_mod)
 ```
+
+**Notes.**
+
+* The donor family’s **fixed FFN expert** (if added as residual) is also scaled: `y_fixed ← (s_type.ffn_fixed · s_layer.G) · y_fixed` before adding to `y_FFN`.
+* S-REG multiplies existing fixed-path gates but does not replace them.
 
 ### 5.4 Halting (outer steps)
 
@@ -383,6 +425,43 @@ dump_head:
 
 * Use: compare dump logits vs final logits, log disagreement per token, visualize hallucination-like divergences.
 * Safety: latency overhead should be <2%. Tests assert zero effect on main loss/grad.
+
+### 5.8 Scale hooks (HRM-L/M/G)
+
+We apply S-REG to **non-GRU** residuals inside HRM loops. GRU updates themselves remain unscaled.
+
+**HRM-L inner loop (t = 1…k)**
+
+```text
+ctxL_t = Attn_L(hL_{t-1}, v0)                           # [T0, d]
+eL_t   = ExpertL(hL_{t-1})                              # top-1 expert from L bank
+
+# Residual aggregations with S-REG
+hL̃_t  = hL_{t-1} + (s_type.attn        · s_layer.L) · DropPath(ctxL_t)
+hL̃_t  = hL̃_t    + (s_type.hrmL_expert · s_layer.L) · DropPath(eL_t)
+
+# GRU update (unchanged)
+hL_t   = GRU_L(hL̃_t, hL_{t-1})
+
+# Shared fixed path (preserves per-cluster gate w_fixL)
+hL_t  += (s_type.hrmL_fixed · s_layer.L) · (w_fixL · FixedL(hL_{t-1}))
+```
+
+**HRM-M inner loop (u = 1…U≤2)**
+
+```text
+poolL = Pool(hL_k)
+ctxM  = Attn_M(hM_{u-1}, v1, extra_kv=poolL)
+eM_u  = ExpertM(hM_{u-1})
+
+hM̃_u = hM_{u-1} + (s_type.attn        · s_layer.M) · DropPath(ctxM)
+hM̃_u = hM̃_u    + (s_type.hrmM_expert · s_layer.M) · DropPath(eM_u)
+
+hM_u  = GRU_M(hM̃_u, hM_{u-1})
+hM_u += (s_type.hrmM_fixed · s_layer.M) · (w_fixM · FixedM(hM_{u-1}))
+```
+
+**Global & FiLM** are handled as in §5.3.
 
 ---
 
@@ -512,28 +591,35 @@ We size clusters and fixed paths so HRM total params sit at ≳~¼ of FFN bank p
 
 These are **knowledge / recall banks** attached to HRM-G. They are carved from donor dense models (Qwen by default, optional Mamba). Instead of fully retraining, we carve neurons, bake in donor gates, partially re-initialize slices to add diversity, and wrap them with adapters. Routing is a 3-tier hierarchy.
 
-#### 6.2.1 Families, Layout, and Donor Layer Priority
+### 6.2.1 Families, Layout, **Flattening**, and Donor Layer Priority
 
-*   **Families:**
-    *   **Qwen (default).** Copy donor LayerNorm + W_up / W_down (Qwen-style MLP). If donor uses gated MLP (SwiGLU, etc.), we drop the explicit gate and compensate via per-neuron scaling `s_{j,c}` (see §6.2.2).
-    *   **Mamba (optional).** We treat mixer FFN equivalents similarly, in their own namespace.
-*   Each family maintains:
-    *   **K = 8 FFN clusters**.
-    *   A single **global fixed FFN expert** (always-on residual path; analogous to `FixedL_shared`).
-*   **Donor Layer Priority:** We prioritize specific donor transformer blocks for FFN capture:
-    *   **Primary capture set (in order):** **6, 8, 10, 12, 13, 14, 16, 18, 20**
-    *   **Optional (if capacity allows):** **17, 11, 15, 4**
-    *   **Rationale:** We bias toward mid/late layers for high-level abstractions but include early/mid layers for syntactic glue, prioritizing semantic diversity over strict depth ordering.
-*   **Interfaces (shared per family):**
-    *   `A_in: d_native → d_donor` (trainable, shared for entire family).
-    *   Donor LayerNorm (gain/bias copied; gains may unfreeze later).
-    *   Two-matrix donor MLP core (initially frozen, except partially re-initialized slice).
-    *   Pool over routed v0 tokens.
-    *   `A_out: d_donor → d_native` (trainable, shared).
-    *   An **alignment loss** on `A_in` outputs (post-donor LN) that forces standardized stats:
-        `|μ| < 0.05`, `|σ − 1| < 0.05`, and running `L_align < 0.1`.
+**Families.**
 
-All experts in the same donor family share the same `A_in` / `A_out`. This lets us swap experts freely.
+Each donor **family** (default: **Qwen**; optional: **Mamba**) contributes a **single, flattened, global FFN bank** shared across the model. A family shares one pair of adapters (`A_in: d_native→d_donor`, `A_out: d_donor→d_native`) and donor LayerNorm stats. There is **no per-trunk-layer FFN bank**: trunk layers *tap* the **same** family bank via tiny per-layer **site adapters** (see §7.4).
+
+**Flattening across donor layers.**
+
+We pool neurons from a **capture set** of donor FFNs and carve them into clustered experts:
+
+1. **Capture set (default = extended):**
+   `capture_layers = {4, 6, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20}` (S=13)
+   *(Optional minimal set retained for budget reductions: {6, 8, 10, 12, 13, 14, 16, 18, 20}, S=9.)*
+
+2. **Neuron pool:** `𝒥_family = ⋃_{ℓ∈capture_layers} J_ℓ`.
+
+3. **Clustering & carving:** K=8 clusters per family; within each cluster, carve sub-experts `E_{c,i}` as neuron subsets `J_{c,i}` with **overlap capped at ρₒᵥ ≤ 0.15**.
+
+4. **Gate-compensation:** bake donor gate means `s_{j,c}` into `W_up` columns; drop donor gates at runtime.
+
+5. **Exposure:** HRM-G retrieves via **family→cluster→expert routing**; trunk taps the same bank through **site adapters** (§7.4).
+
+**Donor priority & metadata.**
+
+We still prioritize mid→late donor layers (as listed) for semantic diversity. Each carved neuron carries `(donor_layer_id, neuron_id)` metadata for analysis and curricula.
+
+**Budgeting note (new defaults).**
+
+For parameter budgeting and counts below, we use a mild uplift in donor FFN expansion **`f_d = 6·dₙ`** (vs ~5.8× before). This is a conservative “donor class” assumption and only affects **counts**, not shapes or training code.
 
 #### 6.2.2 Calibration & carving (per family) [^5][^6]
 
@@ -649,6 +735,128 @@ For each donor family (e.g. Qwen), for each cluster `c`, for each expert `E_{c,i
 5.  **Register routing hooks** with the 3-tier router (family→cluster→expert).
     Routing uses top-1 at every tier plus a low-weight fixed expert residual. Capacity factor is 1.25. All stabilized with Switch-LBL α=0.02→0.01→0.005, z-loss=1e-3, τ 1.2→1.0, router noise 1.0→0.2.
 
+### 6.2.8 Per-Layer **Site Adapters** & **Layer-ID Scales (S-REG-LID)** for Trunk Taps
+
+Trunk layers can “tap” the global family bank (UMoE-lite; see §7.4) using **site adapters** and **layer-ID scales**:
+
+**Site adapters (per tapped trunk layer ℓ).**
+
+To keep parameters tiny and compile-friendly, we use **diag-scale + bias** adapters around both the **fixed** and **routed** FFN paths:
+
+```text
+y_fixed_att(ℓ)  = A_out_fixed(ℓ) · FixedFFN( A_in_fixed(ℓ)  · y_mix )  # diag+bias both sides
+y_expert_att(ℓ) = A_out_route(ℓ) ·  E_top1( A_in_route(ℓ)   · y_mix )
+y_tap(ℓ)        = p(ℓ) · y_expert_att(ℓ) + y_fixed_att(ℓ)              # p(ℓ)∈[0,1], init≈0.3
+```
+
+* `A_in_* (ℓ), A_out_* (ℓ)` are **per-layer diag+bias** (rank-0) parameters; identity-initialized.
+* `p(ℓ)` is a per-layer scalar mixing weight (learned).
+* Core expert weights are **shared** with the family bank (no duplication).
+
+**Layer-ID scales (S-REG-LID).**
+
+We extend S-REG with **per-layer vectors** that modulate residual magnitudes for (a) **trunk attention** and (b) **attention taps**:
+
+```text
+y_att(ℓ)  = x + [ s_type.attn · s_band.attn · s_lid.attn[ℓ] ] · DropPath( Attnℓ(x) )
+y_tap(ℓ)  ←      [ s_type.umoe_tap · s_band.attn_tap · s_lid.attn_tap[ℓ] ] · y_tap(ℓ)
+```
+
+* `s_type.*` and `s_band.*` are the **type** and **band** scales you already added.
+* `s_lid.attn[ℓ]`, `s_lid.attn_tap[ℓ]` are **learned per-layer scalars** (softplus-param) with conservative inits (§7.1.4).
+* If UMoE-lite is disabled, set `s_lid.attn_tap[:] = 0.0` (or omit).
+
+**Invariants.**
+
+All adapters and scales are scalar or diagonal; shapes are static; routers and DSA K-buckets are unaffected.
+
+### 6.2.9 Parameter accounting, **defaults**, and “non-HRM/associated” totals
+
+Let
+
+* `dₙ` = native trunk width (Q0.5B: **896**; Q1.5B: **1536**)
+* `f_d` = **donor FFN expansion for budgeting**, set to **`6·dₙ`** by default
+* `S` = number of **captured donor layers** (**13** by default; optional 9)
+* `η` = carve fraction over captured donor mass (**`0.60`** default)
+* `ρₒᵥ` = max neuron overlap between carved experts (**`0.15`** default)
+* `L_tap` = number of tapped trunk layers (Q0.5B default **2**; Q1.5B default **4**)
+* `L_trunk` = trunk depth (Q0.5B **24**; Q1.5B **28**)
+
+**Reference donor FFN mass across captured layers (per family):**
+
+```text
+P_donor_FFN = 2 · S · dₙ · f_d
+```
+
+**Transplanted shared family bank (per family):**
+
+```text
+P_bank ≈ (η · (1 + ρₒᵥ)) · P_donor_FFN
+```
+
+**Family interfaces (shared A_in/A_out + donor LN):**
+
+```text
+P_family_ifaces ≈ 2 · dₙ · dₙ    # LN terms are O(dₙ), negligible
+```
+
+**UMoE-lite site adapters (diag+bias in/out for fixed+routed) per tapped layer:**
+
+```text
+P_site_per_layer ≈ 8 · dₙ
+P_site_total     ≈ (8 · dₙ) · L_tap
+```
+
+**Routing prototypes (small, included explicitly):**
+
+```text
+P_router_proto ≈ (1 + K) · dₙ   # family + K clusters, K = 8 ⇒ ≈ 9 · dₙ
+```
+
+**Total per family (FFN bank + adapters + routers):**
+
+```text
+P_total_family ≈ P_bank + P_family_ifaces + P_site_total + P_router_proto
+```
+
+**Trunk attention projections (non-HRM, all layers):**
+
+```text
+P_trunk ≈ L_trunk · (4 · dₙ²)   # Q,K,V,O projections; backend extras are ≪ and omitted
+```
+
+**“Non-HRM/associated” total (what you asked for):**
+
+```text
+P_nonHRM_total ≈ P_trunk + P_total_family
+```
+
+#### Defaults & example counts (using S=13, η=0.60, ρₒᵥ=0.15, f_d=6·dₙ)
+
+* **Q0.5B** (`dₙ=896`, `f_d=5376`, `L_trunk=24`, `L_tap=2`)
+
+  * `P_donor_FFN`  ≈ **125.24 M**
+  * `P_bank`       ≈ **86.42 M**
+  * `P_family_ifaces` ≈ **1.61 M**
+  * `P_site_total` ≈ **0.01 M**
+  * `P_router_proto` ≈ **0.01 M**
+  * **`P_total_family` ≈ 88.04 M**
+  * `P_trunk`      ≈ **77.07 M**
+  * **`P_nonHRM_total` ≈ 165.11 M**
+
+* **Q1.5B** (`dₙ=1536`, `f_d=9216`, `L_trunk=28`, `L_tap=4`)
+
+  * `P_donor_FFN`  ≈ **368.05 M**
+  * `P_bank`       ≈ **253.95 M**
+  * `P_family_ifaces` ≈ **4.72 M**
+  * `P_site_total` ≈ **0.05 M**
+  * `P_router_proto` ≈ **0.01 M**
+  * **`P_total_family` ≈ 258.74 M**
+  * `P_trunk`      ≈ **264.24 M**
+  * **`P_nonHRM_total` ≈ 522.98 M**
+
+> Notes: (i) Router/prototype and S-REG scalars are tiny vs. bank/trunk and either included above (prototypes) or intentionally omitted (S-REG) as **≪1%**. (ii) If you switch to the **minimal** capture set (S=9), totals scale **linearly** in S. (iii) Increasing `η` or `ρₒᵥ` beyond the defaults will grow `P_bank` proportionally; we cap `ρₒᵥ` at **0.15** to avoid degeneracy.
+
 ### 6.3 Fixed experts policy (scaffold → fade or repurpose) [^7]
 
 We treat fixed experts (HRM-L/M fixed paths and per-family fixed FFN expert) as scaffolding:
@@ -661,6 +869,24 @@ We treat fixed experts (HRM-L/M fixed paths and per-family fixed FFN expert) as 
     *   Train the fixed path / fixed expert via reverse-KL + orthogonality.
     *   Only unfreeze their tiny adapters/LN gains.
     *   Make them become cheap distilled summary experts.
+
+### 6.4 Expert & fixed-path scaling policy
+
+**Donor FFN bank (transplanted).**
+Scale routed expert and fixed-family outputs before integration at HRM-G:
+
+```text
+y_expert_top1 ← (s_type.ffn_retrieve · s_layer.G) · y_expert_top1
+y_fixed_fam   ← (s_type.ffn_fixed    · s_layer.G) · y_fixed_fam
+```
+
+During **repurpose** (§6.3), freeze `s_type.ffn_fixed` to keep a stable teacher while training adapters/LN gains on the fixed expert.
+
+**HRM reasoning experts (heterogeneous).**
+HRM-L/M expert residuals are always wrapped by S-REG as in §5.8. Size-tier compute priors (κ) and routing losses are unchanged and independent of S-REG.
+
+**Fixed paths (HRM-L/M).**
+S-REG multiplies the contribution **after** the per-cluster scalar gates `w_fix{L,M}`: it does not alter gate anneal schedules or the remove vs repurpose decision flow.
 
 ---
 
@@ -789,6 +1015,38 @@ model:
     - { id: 22, type: linear,     note: "cheap preconditioner for late DSA" }
     - { id: 23, type: sw,         note: "final local polish" }
     - { id: 24, type: dsa,        note: "last-layer global (DSA)" }
+```
+
+### 7.1.4 Layer-ID Scale Tables (Trunk 24/28)
+
+We provide concrete **initializations** for the new layer-ID scales `s_lid.attn[ℓ]` and `s_lid.attn_tap[ℓ]`. They are **learned** (softplus-param) and combine multiplicatively with your `type_priors` and `per_layer` (band) scales.
+
+> Indexing is **1-based** to match §7.1 presets.
+
+**(A) 24-Layer Trunk (matches §7.1.3)**
+
+* DSA at layers **3, 7, 12, 20, 24** → start a bit higher.
+*Proposed tapped layers for UMoE-lite (defaults): **[10, 14]***.
+
+```yaml
+scales:
+  layer_id:
+    trunk:
+      attn:      [0.50, 0.50, 0.60, 0.50, 0.50, 0.50, 0.60, 0.52, 0.53, 0.55, 0.53, 0.60, 0.53, 0.53, 0.55, 0.52, 0.53, 0.53, 0.50, 0.60, 0.50, 0.52, 0.50, 0.60]
+      attn_tap: [0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00]
+```
+
+**(B) 28-Layer Trunk (matches §7.1.2)**
+
+* DSA at **3, 7, 14, 20, 26, 28**. Power at **12, 17, 25** → slightly elevated.
+* Proposed tapped layers: **[6, 12, 18, 24]**.
+
+```yaml
+scales:
+  layer_id:
+    trunk:
+      attn:      [0.50, 0.50, 0.60, 0.50, 0.50, 0.50, 0.60, 0.50, 0.53, 0.55, 0.53, 0.55, 0.53, 0.60, 0.53, 0.53, 0.55, 0.52, 0.53, 0.60, 0.50, 0.52, 0.50, 0.52, 0.55, 0.60, 0.50, 0.60]
+      attn_tap:  [0.00, 0.00, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.00]
 ```
 
 ### 7.2 Attention Backends and Stability Knobs
@@ -926,52 +1184,38 @@ For better long-context extrapolation, trunk layers can use a hybrid positional 
 
 ### 7.4 UMoE-lite — Shared FFN Knowledge Experts in Attention
 
-We allow attention outputs to query the same FFN expert bank used in the FFN sublayer (top-1 expert + fixed expert), using tiny site-specific adapters. This aligns token mixing with donor knowledge while preserving compile invariants.
+We allow selected trunk layers to **tap the global family bank** used at HRM-G, via tiny per-layer site adapters and S-REG-LID.
 
-Where: start with a small subset of trunk layers (e.g., 2–4 mid/deep layers). Consider HRM-L only if compute allows after M6.
+**Data flow at tapped trunk layer ℓ.**
 
-Data flow (per augmented layer):
+```text
+# Base attention output (any backend); GA/SSA happen inside.
+y_att = AttentionBackendℓ(x, ...)
 
-Router biasing: add a small query-derived bias to the FFN cluster router (project the mean head query q̄ with W_q and add it to existing router logits).
-Site adapters: apply diag-scale + bias site adapters (rank-0) around the routed expert and the fixed expert: y_fixed_att = A_out_att_fixed · FixedFFN(A_in_att_fixed · y_mix) y_expert = A_out_att · E_core_top1(A_in_att · y_mix) y_att_tap = p · y_expert + y_fixed_att y_out = y_in + y_att_tap Initialize site adapters to identity (diag=1, bias=0). Initialize p≈0.3.
+# Optional tap into the shared family bank (routed top-1 + fixed expert), with per-layer adapters:
+y_fixed_att(ℓ)  = A_out_fixed(ℓ) · FixedFFN( A_in_fixed(ℓ)  · y_att )
+y_expert_att(ℓ) = A_out_route(ℓ) ·  E_top1(  A_in_route(ℓ)   · y_att )
 
-Warm-up (20–30k steps):
-Freeze core experts (shared with FFN sublayer).
-Train site adapters, router_q_bias, and (optionally) a tiny rank-8 query_delta that nudges attention logits toward the chosen expert during warm-up only (with a small KL to baseline attentions).
-Keep Switch-style load balancing active on routed calls to avoid collapse.
+# Per-layer mixing of routed vs fixed:
+y_tap(ℓ) = p(ℓ) · y_expert_att(ℓ) + y_fixed_att(ℓ)      # p(ℓ)∈[0,1], init≈0.3
 
-Unfreeze:
-After warm-up, unfreeze shared expert weights with a low LR multiplier (e.g., ×0.1) and continue balanced training.
+# S-REG (type · band · layer-ID) scales the tap residual before adding:
+y_tap(ℓ) ← [ s_type.umoe_tap · s_band.attn_tap · s_lid.attn_tap[ℓ] ] · y_tap(ℓ)
 
-Compute budget:
-Enables one extra MLP call (top-1 expert) plus one fixed expert per augmented layer. Aim for ≤8–10% step-time increase on the 1.5B model for four augmented layers; if higher, reduce layers or keep OFF on the 0.5B model.
-
-Config sketch:
-```yaml
-umoe_lite:
-  enable: false
-  layers: [6, 10, 14, 18]          # trunk layers to augment
-  router_q_bias: 0.25              # weight of q̄-projection added to cluster router logits
-  site_adapters:
-    kind: "diag_bias"              # rank-0 (diag scale + bias)
-    init_scale: 1.0
-    init_bias: 0.0
-  expert_fixed_always_on: true
-  p_scale_init: 0.3
-  query_delta:
-    enable: false
-    rank: 8
-    warm_kl: 0.1
-training:
-  warmup_steps: 30000
-  unfreeze_core_lr_mult: 0.1       # low LR for shared expert weights post-warm-up
-  balance:
-    switch_alpha: 1.0e-2
-    zloss: 1.0e-3
-guards:
-  one_backend_per_layer: true       # keep one attention backend per layer
-  compile_static_k: true            # keeps MoE top-1 dispatch static
+# Final residual adds (attention first, then tap):
+y = x
+y = y + [ s_type.attn · s_band.attn · s_lid.attn[ℓ] ] · DropPath( y_att )
+y = y + y_tap(ℓ)                                       # already S-REG-scaled
 ```
+
+**Warm-up & unfreeze.**
+
+* **Warm-up (e.g., 30k steps):** freeze core experts; train only site adapters, `p(ℓ)`, and the MoR query-bias.
+* **Unfreeze:** then unfreeze shared expert weights with a low LR multiplier (×0.1).
+
+**Compute budget.** One extra expert MLP (top-1) + one fixed expert per tapped layer. Limit `L_tap` so step-time stays within budget (e.g., 2–4 tapped layers on the 1.5B model).
+
+**Compile invariants.** One backend per layer; static top-1 dispatch; shapes unchanged.
 
 ### 7.5 Cross-feature Guards & Config Validator
 
@@ -983,6 +1227,24 @@ To manage complexity, our configuration loader enforces these rules:
 - Backend exclusivity:
   - HRM bands: enforce one backend per layer (no mixing).
   - Trunk: allow hybrid_heads (mixing Power and dotprod within a layer) only when hybrid_heads.enable=true in the registry and the split is fixed at init. Otherwise enforce one backend per layer.
+
+### 7.6 Backend-aware residual scales
+
+For any attention backend (`dotprod`, `sigmoid`, `linear`, `power`, `dsa`) in trunk or HRM bands, we scale the **post-mix** residual before adding it to the skip path:
+
+```text
+y_att = AttentionBackend(x, ...)
+y     = x + (s_type.attn · s_layer.attn) · DropPath(y_att)
+```
+
+**Ordering with other knobs.**
+
+* **GA (Gated Attention):** head gates apply first; S-REG scales the aggregated result.
+* **SSA:** temperature affects logits inside the backend; S-REG scales the resulting residual.
+* **DSA:** S-REG is orthogonal to K-selection and does not alter compile-warmed K buckets.
+
+**UMoE-lite taps (if enabled).**
+Scale the tap residual as a whole: `y_att_tap ← (s_type.umoe_tap · s_layer.attn_tap) · y_att_tap`.
 
 ---
 
@@ -1017,6 +1279,13 @@ To reduce latency, we maintain a **per-FFN-cluster low-rank cache**.
 
 *   **Enable-Early Rule:** Features that fundamentally change the model's architecture, like ESE, Power Attention, or Hybrid Positional Encoding, must be enabled at their designated milestone (M5-LC) and then frozen.
 *   **Late-Swap Shielding:** If a backend must be changed mid-project (strongly discouraged), we use a one-epoch distillation shield. The new backend is trained to mimic the attention maps and outputs of the old one, minimizing distribution shift before unfreezing the full model.
+
+### 8.5 Scale-registry invariants
+
+* **Static shapes:** S-REG adds only scalar parameters; no dynamic control flow and no tensor shape changes.
+* **Dispatch invariants:** Does **not** affect router top-k=1 policies, capacities, or K-buckets for DSA; compile warm-ups remain valid.
+* **Residual locality:** Only residual **contributions** are scaled. Core state updates (GRUs) and logits heads remain functionally identical aside from FiLM magnitude scaling (see §5.3 (REPLACED)).
+* **DropPath locality:** S-REG scales the residual **including** DropPath so stochastic depth behavior is preserved.
 
 ---
 
@@ -1487,11 +1756,13 @@ Note: M6 and M7 are defined once in §10 (above); no additional milestone defini
   * weight decay 0.1
   * global grad clip 1.0
   * `bf16` everywhere feasible.
+
 * **LR schedule**
 
   * cosine decay
   * 5% warm-up
   * smaller LR multiplier (×0.5) for family-shared adapters (`A_in`, `A_out`) at first, because we don’t want them to blow up donor scales.
+
 * **Routers**
 
   * τ 1.2→1.0 over ~10k steps
@@ -1499,24 +1770,43 @@ Note: M6 and M7 are defined once in §10 (above); no additional milestone defini
   * Switch-LBL α: 0.02→0.01→0.005
   * z-loss: 1e-3
   * capacity factor: 1.25
+
 * **Halting**
 
   * halter MLP widen×4
   * step penalty target λₒ = 0.01
   * cosine veto auto-enabled if `outer_cap > 8`.
+
 * **Adapters alignment**
 
   * alignment loss weight 0.01
   * unfreeze donor LN gains if `L_align` stalls >1 epoch.
+
 * **Convergence regularizer / one-step gradient**
 
   * OFF by default.
   * We only enable them when we raise outer caps >4 (later milestones).
+
 * **Gate regularization** (GA / head-gated attention)
 
   * L1 on head gates = 1e-4 to encourage sparsity and avoid attention sink.
   * `gate_floor` clamp to 0.02 to avoid dead heads.
   * Slightly slower LR (lr_mult 0.5) on gate params.
+
+### 11.1 Scale parameters (optimizer & schedule)
+
+**Optimizer group (S-REG).**
+All `θ` parameters for S-REG live in a dedicated group:
+
+* LR multiplier: **0.5** vs trunk default
+* Weight decay: **0.0** (optionally 1e-4 if you prefer shrinkage)
+* Soft barrier (optional): penalty `λ_scale · (max(0, s − s_max))²` with defaults `s_max=2.0`, `λ_scale=1e-3`
+
+**Warm-start schedule.**
+Freeze S-REG for the **first 2% tokens** of M1 (lets H-Net/HRM anchor). Unfreeze thereafter and train continuously across all milestones. No special LR warm-up needed beyond global schedule.
+
+**Ablation guard (debug only).**
+A compile-time flag can zero `s_type.*` to verify attribution; this is for tests only and not part of normal training.
 
 ---
 
@@ -1601,6 +1891,22 @@ Note: M6 and M7 are defined once in §10 (above); no additional milestone defini
   * how often we escalate to larger K up to `verify_bump_max_k`,
   * confirm we stay under compile-warmed limits (see §13.4.5).
 
+### S-REG Monitoring & Guardrails
+
+**Scale statistics.**
+Log per-epoch histograms for `s_type.*` and `s_layer.*`. Page if a median leaves `[0.05, 1.80]` for >2 epochs.
+
+**Attribution shares.**
+Track running contribution shares per module type:
+`Share(type) = E[‖(s_type·s_layer·Δ_type)‖₂ / ‖Σ_types Δ‖₂]`.
+Watch for sudden flips near M5 (transplant) and M5-LC (long-context).
+
+**Transplant health.**
+During M5, rising `s_type.ffn_retrieve` should correlate with decreasing adapter alignment loss (`L_align`); alert on sustained anti-correlation (>5k steps).
+
+**Verify-path neutrality.**
+S-REG must not change the rate of **verify_bump** requests unrelated to confidence/innovation triggers. Track verify usage stratified by `s_type.*` deciles; differences >10% absolute trigger investigation.
+
 ---
 
 ## 13) Tests by milestone
@@ -1656,6 +1962,33 @@ Note: M6 and M7 are defined once in §10 (above); no additional milestone defini
 - M7 (Hybrid & scale-out):
   - 2-node speedup ≥1.6×; DDP compile intact.
   - Cross-family check (if hybrid bank): verify path prototype checks work and do not regress compile stability.
+
+### 13.1 S-REG Tests by milestone
+
+* **M1 (Chunker)**
+
+  * Enabling S-REG after 2% tokens maintains hockey-stick (§4.6).
+  * PPL delta vs no-S-REG (shadow) ≤ **0.1%**.
+
+* **M3 (Full HRM)**
+
+  * With GA+SSA+S-REG, first-token mass drops ≥**5×** vs baseline.
+  * Turning S-REG OFF (shadow) regresses ARC dev by ≥**2%** relative.
+
+* **M4 (HRM MoE)**
+
+  * HRM-L/M tier utilization stays near targets; no expert dead-zones emerge with S-REG ON.
+  * Removal test for fixed paths (§6.1.4) unchanged by S-REG presence.
+
+* **M5 (FFN Transplant)**
+
+  * Temporarily zeroing `s_type.ffn_retrieve` for 1k steps increases PPL by ≥**0.5%** abs at equal compute (sanity).
+  * `L_align < 0.1` holds while `s_type.ffn_retrieve` rises to ≥**0.6** median.
+
+* **M5-LC (Long-context)**
+
+  * DSA K-bucket selection **identical** with/without S-REG.
+  * Length-gen test: ≤**0.5%** loss delta at ≥16× context vs baseline at matched compute.
 
 ---
 
@@ -1817,7 +2150,7 @@ This list represents the core engineering tickets to be implemented.
 
 ---
 
-## 16) Example config (small model excerpt + attention / policy knobs)
+## 16) Example config (small model excerpt + attention / policy knobs + S-REG)
 
 ```yaml
 model:
@@ -1857,7 +2190,7 @@ hrm:
     innovation_gate: {enable: true, w: 0.5}
 
   halting:
-    type: mlp                   # or "bce_no_extra_pass" per THPL
+    type: mlp
     mlp_widen: 4
     step_penalty_target: 0.01
     cosine_safety: { enable_if_outer_cap: 8, epsilon: 0.05, gamma: 5.0 }
@@ -1865,6 +2198,15 @@ hrm:
     use_innovation: true
 
   caps_from_thpl: true
+
+  # ---- S-REG hooks for HRM bands ----
+  scales:
+    apply_attn:      true    # scale HRM L/M attention residuals
+    apply_L_expert:  true    # scale HRM-L expert residuals
+    apply_M_expert:  true    # scale HRM-M expert residuals
+    apply_L_fixed:   true    # multiplies existing w_fixL gate
+    apply_M_fixed:   true    # multiplies existing w_fixM gate
+    apply_film:      true    # scales FiLM (γ,β) magnitude
 
 hrm_experts:
   compute_prior_kappa: { L: 0.20, M: 0.10 }
@@ -1884,6 +2226,9 @@ hrm_experts:
     bias_from_innovation:
       hrm_cluster: {enable: true, coef: 0.1}
       ffn_mor:     {enable: true, coef: 0.1}
+  # ---- S-REG acknowledgment for HRM experts ----
+  scales:
+    compute_prior_unchanged: true   # κ unchanged; S-REG orthogonal
 
 ffn_bank:
   families:
@@ -1906,8 +2251,11 @@ ffn_bank:
         rho_applied: 0.10
         rho_target: 0.25
         min_cols: "max(32, ceil(0.05*f_i))"
+      # ---- S-REG hooks for donor FFN outputs ----
+      scales:
+        apply_routed: true   # s_type.ffn_retrieve * s_layer.G
+        apply_fixed:  true   # s_type.ffn_fixed    * s_layer.G
 
-# Attention backends & stability (HRM-L focus; trunk set under long_context)
 attention:
   ssa:
     enable: {hrm_l: true, hrm_m: false}
@@ -1935,9 +2283,12 @@ attention:
     key_bias: {enable: true, l2_weight: 1e-5}
     logit_clip: {enable: true, tau: 6.0}
   sigmoid_attention:
-    enable: {hrm_l: false}     # turn on only if sink persists; SSA auto-disabled on these bands
+    enable: {hrm_l: false}     # if sink persists, set true; SSA auto-disabled on these bands
     head_bias_init: -1.5
     scale_norm: true
+  # ---- S-REG hook for all attention residuals ----
+  scales:
+    apply: true   # residual post-mix scaled by s_type.attn * s_layer.attn
 
 # Long-context registry, ESE, DSA (frozen at M5-LC)
 long_context:
@@ -1954,12 +2305,12 @@ long_context:
   attention_registry:
     trunk:
       pattern:
-        - {layers: [12,16,20,24], impl: "dsa"}        # or "power"
+        - {layers: [12,16,20,24], impl: "dsa"}
         - {layers: [28],          impl: "power", m: 256}
       hybrid_heads: {enable: false}
     hrm_l:
       pattern:
-        - {layers: "all", impl: "dotprod"}            # can swap to "sigmoid"/"afa" per ablations
+        - {layers: "all", impl: "dotprod"}
     immutable_after_compile: true
   dsa_defaults:
     ratio: 0.05
@@ -1977,7 +2328,7 @@ long_context:
 
 selective_confidence:
   enable: true
-  mode: "verify_only"            # strict | verify_only | report_only
+  mode: "verify_only"
   target_coverage: 0.92
   lambda_seq_vs_tok: 0.6
   thresholds: {abstain: 0.35, verify: 0.45, ok: 0.55, tok_low: 0.20}
@@ -1994,6 +2345,7 @@ selective_confidence:
   verify_qol:
     proto_two_shot: {enable: true, cos_thresh: 0.85}
     span_bunching:  {enable: true, max_gap_tokens: 8}
+
 entity_risk:
   enable: true
   head: {hidden: 64}
@@ -2020,6 +2372,159 @@ config_guards:
   - rule: "one_backend_per_layer"
   - rule: "trunk_full_sdpa_requires_mem_ok"
   - rule: "no_abstain_when_mode_verify_only"
+
+# ---------------- S-REG master block ----------------
+scales:
+  enable: true
+  parameterization: "softplus"      # non-negative; compile-safe
+  clamp:
+    max: 2.0                        # soft barrier (see optimizer.barrier)
+  # These values are softplus-ed, so ~0.54->1.0 and ~0.11->0.75 and ~0.0->0.667
+  init:
+    type_priors:                    # module-type priors
+      attn:         0.45
+      ffn_retrieve: 0.35
+      ffn_fixed:    0.25
+      hrmL_expert:  0.25
+      hrmM_expert:  0.30
+      hrmL_fixed:   0.35
+      hrmM_fixed:   0.35
+      film:         0.55
+      umoe_tap:     0.25
+    per_layer:                      # band/layer priors
+      L:         0.35
+      M:         0.40
+      G:         0.55
+      attn:      0.55
+      attn_tap:  0.35
+  optimizer:
+    lr_mult: 0.5
+    weight_decay: 0.0
+    barrier:
+      enable: true
+      s_max: 2.0
+      lambda: 1.0e-3
+  schedule:
+    warm_start_freeze_tokens_frac: 0.02
+
+# ---- Layer-ID scale tables (initializations) ----
+scales:
+  layer_id:
+
+    # 24-layer (0.5B source model)
+    trunk:
+      attn:      [0.50, 0.50, 0.60, 0.50, 0.50, 0.50, 0.60, 0.52, 0.53, 0.55, 0.53, 0.60,
+                  0.53, 0.53, 0.55, 0.52, 0.53, 0.53, 0.50, 0.60, 0.50, 0.52, 0.50, 0.60]
+      attn_tap:  [0.00, 0.00, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00,
+                  0.00, 0.35, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00]
+
+    # 28-layer (1.5B source model)
+    # trunk:
+    #   attn:      [0.50, 0.50, 0.60, 0.50, 0.50, 0.50, 0.60, 0.50, 0.53, 0.55, 0.53, 0.55, 0.53, 0.60, 0.53, 0.53, 0.55, 0.52, 0.53, 0.60, 0.50, 0.52, 0.50, 0.52, 0.55, 0.60, 0.50, 0.60]
+    #   attn_tap:  [0.00, 0.00, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.00]
+
+# ---- S-REG hooks (already in your config; shown here for clarity) ----
+attention:
+  scales:
+    apply: true                        # s_type.attn * s_band.attn * s_lid.attn[ℓ]
+
+hrm:
+  scales:
+    apply_film: true
+
+ffn_bank:
+  families:
+    qwen:
+      scales:
+        apply_routed: true
+        apply_fixed:  true
+
+# ---- Donor capture defaults (family bank carving) ----
+ffn_bank:
+  families:
+    qwen:
+      carving:
+        # DEFAULT (extended) capture set for higher bank capacity
+        capture_layers: [4, 6, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20]  # S = 13 (default)
+
+        # Optional minimal set (leave commented unless you re-budget)
+        # capture_layers: [6, 8, 10, 12, 13, 14, 16, 18, 20]               # S = 9 (optional)
+
+        eta: 0.60                      # carve fraction η (↑ from 0.50)
+        overlap_max: 0.15              # ≤15% neuron overlap across carved experts
+
+      # Parameter-budget assumptions used for counts (informational only)
+      budget_notes:
+        donor_ffn_expansion: "f_d = 6 * d_n (planning uplift; affects counts only)"
+        formulas:
+          donor_ffn:      "P_donor_FFN = 2 * S * d_n * f_d"
+          bank:           "P_bank = (eta * (1 + overlap_max)) * P_donor_FFN"
+          interfaces:     "P_family_ifaces ≈ 2 * d_n * d_n"
+          site_adapters:  "P_site_total ≈ (8 * d_n) * L_tap"
+          trunk:          "P_trunk ≈ L_trunk * (4 * d_n^2)"
+          non_hrm_total:  "P_nonHRM_total ≈ P_trunk + P_bank + P_family_ifaces + P_site_total + P_router_proto"
+        defaults_q05b:
+          d_n: 896
+          f_d: "5376  (= 6 * 896)"
+          S: 13
+          eta: 0.60
+          overlap_max: 0.15
+          L_trunk: 24
+          L_tap: 2
+          approx_params_M:
+            donor_ffn: 125.24
+            bank: 86.42
+            interfaces: 1.61
+            site_adapters: 0.01
+            total_family: 88.04
+            trunk: 77.07
+            non_hrm_total: 165.11
+        # defaults_q15b (commented; enable if training Q1.5B)
+        # d_n: 1536
+        # f_d: "9216 (= 6 * 1536)"
+        # S: 13
+        # eta: 0.60
+        # overlap_max: 0.15
+        # L_trunk: 28
+        # L_tap: 4
+        # approx_params_M:
+        #   donor_ffn: 368.05
+        #   bank: 253.95
+        #   interfaces: 4.72
+        #   site_adapters: 0.05
+        #   total_family: 258.74
+        #   trunk: 264.24
+        #   non_hrm_total: 522.98
+
+# ---- UMoE-lite site taps (explicit 0.5B defaults; 1.5B commented) ----
+umoe_lite:
+  enable: true
+  layers: [10, 14]                 # Q0.5B: two taps explicit
+  router_q_bias: 0.25
+  site_adapters:
+    kind: "diag_bias"              # per-layer diag scale + bias for fixed+routed paths
+    init_scale: 1.0
+    init_bias: 0.0
+    per_layer: true
+  expert_fixed_always_on: true
+  p_scale_init: 0.3
+
+# Q1.5B taps (enable if using 1.5B)
+# umoe_lite:
+#   enable: true
+#   layers: [6, 12, 18, 24]        # Q1.5B: four taps explicit
+#   router_q_bias: 0.25
+#   site_adapters:
+#     kind: "diag_bias"
+#     init_scale: 1.0
+#     init_bias: 0.0
+#     per_layer: true
+#   expert_fixed_always_on: true
+#   p_scale_init: 0.3
+
+training:
+  umoe_warmup_steps: 30000         # freeze shared experts during warm-up
+  unfreeze_core_lr_mult: 0.1
 ```
 
 ---
