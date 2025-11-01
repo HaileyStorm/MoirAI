@@ -69,93 +69,72 @@ S-REG multiplies residuals from: HRM-L/M attention, HRM-L/M top-1 experts, HRM f
 
 ---
 
-## 2) Model variants (trunks trained from scratch; Qwen-aligned dims) [^14][^15]
+## 2) Model variants (trunks trained from scratch; Qwen‑aligned dims) [^14][^15]
 
-| Variant          | Layers | d_model | Donor FFN width (f) | HRM clusters C_hrm | FFN clusters K (per family) |
-| ---------------- | -----: | ------: | ------------------: | -----------------: | --------------------------: |
-| **MoirAI-Q0.5B** |     24 |     896 |               4 864 |                  **4** |                           8 |
-| **MoirAI-Q1.5B** |     28 |   1 536 |               8 960 |                  **6** |                           8 |
+**Canonical variant names include the final total parameter count and the estimated average *active* parameters per token.**
 
-* The intent is to use MoirAI-Q0.5B during development and validation of processes and code, and then train MoirAI-Q1.5B (possibily also transplanting Mamba mixers) using those validated processes and code.
-* HRM clusters scale with model size (Q0.5B → 4 clusters, Q1.5B → 6 clusters) to keep total HRM parameters ≳ ~¼ of the FFN parameter budget.
-* “Family” = donor lineage; default: Qwen.
-  Optional: Mamba mixers as a second family.
+| Variant (canonical)   | Layers | d_model | HRM clusters | FFN clusters (per family) | Approx **total params** | **Avg active params / token** |
+| --------------------- | :----: | :-----: | :----------: | :-----------------------: | :---------------------: | :---------------------------: |
+| **MoirAI‑0.9B‑A0.3B** |   24   |   896   |       4      |             8             |          ≈0.93B         |          ≈0.30–0.38B          |
+| **MoirAI‑2.9B‑A0.9B** |   28   |  1 536  |       6      |             8             |          ≈2.92B         |          ≈0.82–0.90B          |
 
-### 2.1 Trunk depth vs donor capture set (clarification & indexing)
+**Definition of “active”.** For a token, active parameters include: the selected HRM cluster’s L/M experts (top‑1 each), any non‑zero shared fixed HRM path, the retrieved FFN expert (family→cluster→expert, top‑1), trunk attention projections in the executed layers/heads, FiLM broadcast, and the ByteHead. DropPath and halting are accounted for.
 
-**Trunk depth is fixed by variant.**
+### 2.1 Trunk depth, indexing, and donor capture
 
-* **Q0.5B:** 24 trunk layers (see §7.1.3).
-* **Q1.5B:** 28 trunk layers (see §7.1.2).
-
-**Donor capture set is separate.**
-
-We select a **subset of donor FFN layers** (`capture_layers`) to build one **global, flattened** family bank (§6.2.1). This does **not** remove trunk layers and **does not** renumber them.
-
-**Indexing and taps.**
-
-All trunk references (attention backends, S-REG-LID, UMoE-lite taps) use **1-based trunk indexing** over the full 24/28 layers. A tap list (e.g., `[6,12,18,24]`) is a **subset** of those indices; no re-indexing occurs even if the donor capture set changes.
+* **Trunk depth** by variant: 24 (MoirAI‑0.9B‑A0.3B) and 28 (MoirAI‑2.9B‑A0.9B).
+* **Layer indexing:** 1‑based over the full trunk; taps and S‑REG Layer‑ID scales use this indexing.
+* **Donor capture:** donor layers forming the FFN family bank are chosen by the data‑driven selector (see §6.2.1) and do not renumber trunk layers.
 
 ### 2.2 HRM band widths & heterogeneous tiers (per variant)
 
-This section pins down **band widths**, the **five‑ratio tiering** (with rounding policy in §6.1.0), **per‑cluster multiplicities**, and **intended pick‑rate biases** for each model.
+This subsection fixes **band widths**, **tier ratios with rounding**, **per‑cluster multiplicities**, and **intended pick‑rate biases**. Rounding follows §6.1.0. Variant names include both total and average active parameter counts.
 
-> **Rounding & recording** follow §6.1.0: snap near powers‑of‑two, otherwise even/64‑aligned; enforce minimum expert widths; and **record** `ratio = rounded_width / band_width` (per band). All “rounded widths” below already reflect those rules.
+#### 2.2.1 **MoirAI‑0.9B‑A0.3B**
 
-#### 2.2.1 **MoirAI‑Q0.5B** (high‑granularity)
+* **Band widths:** (d_L = 1920), (d_M = 2880); (d_G = 2\cdot d_L = 3840).
+* **Ratios → rounded widths (L / M):**
 
-* **Band widths:** `d_L = 1920`, `d_M = 2880`  (keeps `d_M = 1.5·d_L`)
-
-* **Ratios (five)** → **rounded widths (L / M):**
-
-  * **0.2667× (4/15)** → **512 / 768**  (512 is 2^9; 768 is 64‑aligned)
+  * **0.2667× (4/15)** → **512 / 768**  (512 is (2^9); 768 is 64‑aligned)
   * **0.50×** → **960 / 1440**
   * **0.75×** → **1440 / 2160**
   * **1.00×** → **1920 / 2880**
-  * **1.25× (escape)** → **2432 / 3584**  (64‑aligned within ≤2% of 1.25×)
-
-* **Counts per cluster (capacity‑preserving):**
+  * **1.25× (escape)** → **2432 / 3584**  (64‑aligned within ≤2% of 1.25×)
+* **Per‑cluster multiplicities:**
 
   * **HRM‑L (8 total):** { **0.2667×: 4**, 0.50×: 1, 0.75×: 1, 1.00×: 1, 1.25×: 1 }
   * **HRM‑M (5 total):** { **0.2667×: 1**, 0.50×: 1, 0.75×: 1, 1.00×: 1, 1.25×: 1 }
-  * **Clusters:** **4**.
+* **Pick‑rate intent (steady state):**
 
-* **Target pick rates (steady state):**
+  * **L:** ~88–92% to **0.2667×**, ~5–8% to 0.50×, remainder thin across larger tiers.
+  * **M:** ~85–90% to **0.2667×**, remainder across larger tiers.
 
-  * **L:** ~**88–92%** to **0.2667×**, **5–8%** to **0.50×**, remainder thin across larger tiers.
-  * **M:** ~**85–90%** to **0.2667×**, remainder across larger tiers.
+#### 2.2.2 **MoirAI‑2.9B‑A0.9B**
 
-* **Granularity** (define **g = 1/ratio**; larger g ⇒ finer allocation):
+* **Band widths:** (d_L = 3072), (d_M = 4096) (reduced vs 1.5× to contain quadratic cost); (d_G = 2\cdot d_L = 6144).
+* **Ratios → rounded widths (L / M):**
 
-  * 0.2667× → **3.75×**, 0.50× → **2.00×**, 0.75× → **1.33×**, 1.00× → **1.00×**, 1.25× → **0.80×**.
-  * **Average granularity (rounded widths): ~**3.5**.
-
-#### 2.2.2 **MoirAI‑Q1.5B** (budget‑adjusted HRM ≈ **2.36B** params)
-
-* **Band widths:** `d_L = 3072`, `d_M = 4096`  (reduced **M** vs 1.5× to contain quadratic cost while preserving compile invariants)
-
-* **Ratios (five)** → **rounded widths (L / M):**
-
-  * **0.3333× (1/3)** → **1024 / 1344**  (L snaps to 1024; M aligns to 1344)
+  * **0.3333× (1/3)** → **1024 / 1344**  (L snaps to 1024; M aligns to 1344)
   * **0.50×** → **1536 / 2048**
   * **0.75×** → **2304 / 3072**
   * **1.00×** → **3072 / 4096**
-  * **1.20× (escape)** → **3712 / 4928**  (64‑aligned; >1.0 headroom)
-
-* **Counts per cluster:**
+  * **1.20× (escape)** → **3712 / 4928**  (64‑aligned; >1.0 headroom)
+* **Per‑cluster multiplicities:**
 
   * **HRM‑L (6 total):** { **0.3333×: 2**, 0.50×: 1, 0.75×: 1, 1.00×: 1, 1.20×: 1 }
   * **HRM‑M (5 total):** { 0.3333×: 1, 0.50×: 1, 0.75×: 1, 1.00×: 1, 1.20×: 1 }
-  * **Clusters:** **6**.
+* **Pick‑rate intent (steady state):**
 
-* **Target pick rates (steady state):**
+  * **L:** ≥90% to **0.3333×**; escape 1.20× is rare.
+  * **M:** ≥88% to **0.3333×**; remainder across larger tiers.
 
-  * **L:** **≥90%** to **0.3333×**; escape 1.20× is rare.
-  * **M:** **≥88%** to **0.3333×**; remainder across larger tiers.
+**Compute priors and curricula** are specified in §6.1.3. Shapes remain static; dispatch is top‑1.
 
-* **Granularity:** 0.3333× → **3.00×**, 0.50× → **2.00×**, 0.75× → **1.33×**, 1.00× → **1.00×**, 1.20× → **0.83×**.
+### 2.3 Active‑parameter accounting and attention backend impact
 
-  * **Average granularity (rounded widths): ~**3.0–3.1**.
+* **Fixed backends:** choosing a specific per‑layer backend (e.g., SDPA, DSA, Power) fixes the attention projection parameter cost for that layer, so active counts stabilize quickly.
+* **Learned→fixed backends:** a head‑scoped dual‑exec mixer may be used temporarily; an entropy/L1 penalty drives a **near‑binary** mixing coefficient, after which the layer behaves as a fixed‑backend layer and active counts converge.
+* **Per‑token backend routing is not used.** Attention backends are either fixed or learned→fixed; dynamic per‑token routing of backends is out of scope to preserve compile invariants and predictable active counts.
 
 ---
 
@@ -204,20 +183,13 @@ We bias attention cost down while letting information flow:
 
 This is block-sparse / windowed, making H-Net efficient.
 
-### 4.5 Target-bits curriculum
+### 4.5 Target‑bits curriculum
 
-We anneal token sizes gradually:
+A two‑phase schedule anneals token sizes:
 
-*   **Early (M1 → early M2):**
-    v0=64 bits, v1=1 024 bits, v2=16 384 bits.
-*   **Late M2 → M3:**
-    Cosine-anneal to **32 / 512 / 8 192** bits.
-
-During the switchover:
-
-*   Freeze Level-2 (the high-level band) for one epoch to stabilize.
-*   Keep ratio/entropy losses active.
-*   Use the wider ±20% zero band while annealing.
+* **Early (M1 → early M2):** v0 = 64 bits, v1 = 1 024 bits, v2 = 16 384 bits with **±20%** Huber zero‑band.
+* **Late (late M2 → M3):** cosine‑anneal to **32/512/8 192** bits and tighten the Huber zero‑band to **±10%**.
+* Freeze Level‑2 for one epoch during the switchover, keep ratio/entropy losses active, and use the wider band only during anneal.
 
 ### 4.6 Early-phase “hockey-stick” guardrails (M1)
 
@@ -247,32 +219,23 @@ hnet.hockeystick:
 
 We unit-test this detector on synthetic traces and assert it triggers expected interventions.
 
-### 4.7 Spacing / first-byte pathology mitigations (M3)
+### 4.7 Spacing / first‑byte pathology mitigations (text presets default)
 
-Observed path: with English spacing, H-Net tends to pick **“hard”** chunk boundaries where the **decoder must guess the first byte of the *next* word** (space-first-byte issue). Two lightweight fixes (optional; default OFF unless text-heavy):
+**First‑Byte Assist (FBA) is ON by default for *text* presets via THPL; the boundary anchor prior remains OFF unless validated for the domain.**
 
-1.  **First-Byte Assist (FBA)**
-    *   A tiny MLP that takes `[pool(hL_k), hG'']` and emits a per-token scalar boost *only* at positions tagged “first-byte-after-boundary”.
-    *   We add that boost as a logit bias `Δℓ = w_fba * bias(token_is_first)` to the byte head.
-    *   Shapes stay static; high weight decay so it doesn’t dominate.
+1. **First‑Byte Assist (FBA)** – A tiny MLP emits a scalar bias only at “first‑byte‑after‑boundary” positions; added to the byte logits path. High weight decay; strictly additive; shape‑stable.
 
-2.  **Boundary Anchor Prior (soft)**
-    *   Add a tiny `is_space_or_delim` feature (ASCII space, tab, some punctuation) into the v0 boundary head MLP with coefficient ≤0.05.
-    *   This gently nudges boundaries to align after obvious delimiters.
-    *   Must be disabled for ARC/code/CJK etc. unless validated.
+2. **Boundary Anchor Prior (soft)** – A small “is_space_or_delim” feature can be fed into the v0 boundary head MLP (coef ≤0.05). **Default OFF** for code/CJK/ARC unless validated.
 
-Config:
+Config (policy‑gated):
 
 ```yaml
 hnet.spacing_helpers:
-  fba: {enable: true, weight: 0.3}
+  fba: {enable: true, weight: 0.3}      # THPL enables for text presets
   anchor_prior: {enable: false, max_coef: 0.05}
 ```
 
-Tests compare:
-
-*   first-byte error rates at chunk starts (English vs CamelCase vs CJK vs code identifiers),
-*   general perplexity cost (must not regress >0.1% on broad text).
+Tests: first‑byte error rates at boundaries (English vs CamelCase vs CJK vs code); overall perplexity guard ≤0.1% regression.
 
 ### 4.8 Compression spikes are **signals**, not always failures
 
@@ -301,21 +264,21 @@ We explicitly distinguish three chunk definitions so instrumentation doesn’t c
 
 We log metrics per view; “first-byte errors” live in D-span, not M-point.
 
-### 4.10 Re-chunk on demand (optional; M4+)
+### 4.10 Re‑chunk on demand (optional; gated & budgeted)
 
-Full RL-controlled dynamic chunking is out-of-scope early. As a cheap alternative:
+One sliding window may be re‑encoded when HRM‑G flags misalignment:
 
-Allow one re-encode pass of the current sliding window when HRM-G flags bad alignment (e.g., high innovation per AFA and far-from-prototype per the selective-confidence features). Implementation: maintain a second set of boundary logits in a preallocated buffer; when triggered, recompute v0/v1 for that window only and continue. No shape changes.
-
-Config:
 ```yaml
 hnet.rechunk_on_demand:
   enable: false
-  trigger: {innov_pctl: 97, proto_sim_max: 0.15}   # innovation: §7.2.1; prototype distance: §14.1
+  trigger: {innov_pctl: 97, proto_sim_max: 0.15}
   window_tokens: 1024
+  budget:
+    max_triggers_per_1k_tokens: 1
+    p95_latency_guard_pct: 5
 ```
 
-By default OFF. We measure latency overhead and quality gain before enabling.
+Buffers are pre‑allocated; shapes remain static. Auto‑disable on budget violations.
 
 ### 4.11 Tests & monitors for H-Net
 
@@ -358,15 +321,23 @@ Each cluster has its own expert banks (see §6). Clusters are *not* shared acros
 
 When innovation-based router bias is enabled (see §7.2.1), we add a small bias term favoring clusters historically good at handling “surprising” spans.
 
+#### 5.1.1 Optional top‑2 HRM cluster routing (policy‑gated; later)
+
+A policy‑gated variant permits **top‑2** cluster routing for high‑complexity tasks under static shapes. Capacity factor is **1.25** with **pre‑allocated** buffers for the second cluster. A complexity predicate (e.g., high innovation and large prototype distance) enables this mode, typically **restricted to the verify path**. Disable automatically if step‑time or memory guards are exceeded.
+
+#### 5.1.2 Soft co‑activation across non‑selected clusters (optional; later)
+
+Two **low‑weight** S‑REG‑scaled summary readouts from non‑selected clusters can be added to the active cluster’s context. These paths are **always present** at compile time but start with very small priors and may be automatically frozen or pruned via S‑REG attribution if impact remains negligible.
+
 ### 5.2 Widths & iteration caps
 
 We parameterize HRM widths by **band** and **variant**.
 
 * Let **d_L** and **d_M** be the HRM‑L and HRM‑M band widths for the chosen model variant (see **§2.2**).
-* **HRM‑G** width is **2·d_L** (unchanged).
+* **HRM‑G** width is **2·d_L**.
 * Iteration caps are unchanged; only widths are variant‑specific.
 
-**Iteration caps (unchanged):**
+**Iteration caps:**
 
 * **HRM‑L:** iteration cap `k ≤ 4`.
 * **HRM‑M:** iteration cap `U ≤ 2`.
@@ -378,6 +349,29 @@ We parameterize HRM widths by **band** and **variant**.
 
 * For **Q0.5B**, we keep `d_M = 1.5·d_L`.
 * For **Q1.5B**, we **override** `d_M` (not 1.5×) to reduce quadratic cost; see **§2.2**.
+
+#### 5.2.1 Iteration heuristics & auto‑tuning triggers
+
+**Targets.** Typical steady‑state usage aims at **L≈3 iterations** and **M≈1–2 iterations**, subject to per‑task limits.
+
+**Signals.** Adjust within caps using:
+
+* innovation magnitude (AFA),
+* halter margin,
+* (|\Delta h_G|) norm trends,
+* local overflow/dead‑expert rates.
+
+**Policy.** Within the configured caps, raise or lower the *suggested* inner‑loop counts per sample using a small bias on the halter’s continue logit and on per‑band “continue” thresholds. This works jointly with §9.4 auto‑tuning of **caps** (outer_max, l_max, m_max). All adjustments are logged and bounded by caps.
+
+#### 5.2.2 Learned window indexing for HRM‑M (optional; later)
+
+A pointer mechanism can **index one additional v1 chunk** into HRM‑M attention per inner step:
+
+* **Inputs:** current (hM_{u-1}), pooled (hL_k), and optional task features.
+* **Output:** a single extra key/value window chosen from nearby v1 chunks.
+* **Regularization:** a small penalty discourages overuse; budgeted to ≤1 extra window per u.
+* **Implementation:** pre‑allocate KV buffers for the extra window; keep shapes static.
+* **Status:** optional later experiment; disabled by default.
 
 ### 5.3 Exact loop inside a chosen cluster
 
@@ -434,35 +428,57 @@ logits = ByteHead(hL_mod)
 * The donor family’s **fixed FFN expert** (if added as residual) is also scaled: `y_fixed ← (s_type.ffn_fixed · s_layer.G) · y_fixed` before adding to `y_FFN`.
 * S-REG multiplies existing fixed-path gates but does not replace them.
 
-### 5.4 Halting (outer steps)
+#### 5.3.1 Learned residual aggregator (replaces hard adds)
 
-We run outer reasoning steps until halting fires or THPL-enforced caps are hit.
+Residual merges that previously used a hard add are implemented as a **learned convex aggregator**:
 
-- Primary halter:
-  - A 2-layer MLP halter consumes hG'' (and, if enabled, innovation stats; see §7.2.1) and outputs a continue probability via ACT (adaptive computation time).
-  - Step penalty λₒ is targeted at 0.01 (linear warm-up).
+[
+\tilde{h} ;=; \alpha\cdot x ;+; (1-\alpha)\cdot r,\quad
+\alpha ;=; \sigma!\big(w^\top f([x,r])\big),
+]
 
-- Halting style is task-specific (THPL):
-  - "cosine_mlp" for NL/seq2seq tasks.
-  - "bce_no_extra_pass" for structured puzzle heads.
+where (f) is a small feature projection (e.g., LayerNorm(x), LayerNorm(r), and their dot). Optionally apply **LayerScale** on the output to keep magnitudes in range. **S‑REG scales remain outside** this aggregator so attribution is preserved. Shapes are unchanged.
 
-- Cosine veto (optional):
-  - When outer_cap > 8, stop early if ‖hG_t − hG_{t-1}‖₂ < ε (ε=0.05) or subtract γ=5 from the continue logit.
+### 5.4 Halting (outer steps) [^30]
 
-- Convergence regularizer (OFF by default):
-  - Tiny penalty on too-rapid shrinkage of ‖Δh‖ or on GRU Jacobian spectral norm; enable only when raising outer caps high.
+The model iterates outer steps until the halter stops or policy caps are reached.
 
-- One-step gradient (OFF by default):
-  - For very long outer caps (>4), backprop only through final states and add light deep supervision on L/M to stabilize.
+* **Halter:** 2‑layer MLP with ACT over (hG''); step penalty (\lambda_o=0.01).
+* **Styles:** task‑specific (e.g., cosine_mlp, bce_no_extra_pass).
+* **Cosine veto:** optional stop when (|\Delta h_G|) is small under high caps.
+* **Convergence guard:** small regularizer when outer caps rise (see §11.2).
+* **Train vs inference caps:** training **outer_max ≤16**; inference may allow higher, per policy.
+* **Gradients:** default **truncated BPTT across outer steps** (full gradients across inner L/M loops of the final step).
 
-- BPTT flag:
-  - Full BPTT across outer steps is disabled by default. If
-    policy.bptt_enabled (from THPL)
-    AND cfg.allow_bptt
-    AND task_id ∈ cfg.bptt_tasks,
-    then allow truncated BPTT; else truncate to 1-step.
+**Inference halting bias** [^28] — THPL can set:
 
-THPL also provides per-task loop caps (outer_max, l_max, m_max). Halting must respect those caps even if the learned halter wants to continue.
+```yaml
+policy.halt_offset: +5.0   # default 0.0; clipped to +7.5
+```
+
+**Mixed‑BPTT sprinkles** [^31] — with small probabilities, enable gradients through the first or first+second outer steps, run a backward pass, clear gradients, then run the final step and backward. Activation checkpointing and OOM‑based auto‑throttling are required.
+
+#### 5.4.1 Inference halting bias (logit offset) [^28]
+
+THPL exposes **policy.halt_offset** to bias continue logits **at inference only**:
+
+```yaml
+policy.halt_offset: +5.0   # default 0.0; clipped to +7.5
+```
+
+This reduces false positives/negatives on compute‑sensitive tasks without retraining. Effects are profiled per task.
+
+#### 5.4.2 Mixed‑precision hygiene for the halter
+
+Halter MLP runs in the model’s global precision (see §11). When instability is detected (rare), only the *final* halter linear may be promoted to fp32 compute with fp16 weights to stabilize thresholds; this retains compile invariants.
+
+#### 5.4.3 Mixed‑BPTT sprinkles (prefix passes) [^31]
+
+To provide upstream credit while bounding memory:
+
+* With small probabilities per batch, **enable gradients through the first or first+second outer steps**, perform a backward pass, **clear grads**, then run the final step and backward again.
+* Activation checkpointing on outer‑step boundaries is required; on OOM sentinels, automatically reduce sprinkle rates.
+* Counters for truncated vs sprinkle modes are logged.
 
 ### 5.5 FiLM broadcast and byte head
 
@@ -475,12 +491,20 @@ After integrating FFN knowledge (hG''), we generate FiLM parameters and steer ou
 
 FiLM magnitude can optionally be gated by innovation (see §7.2.1): scale (γ,β) by σ(w · innov_mean) to avoid over-steering when the model is already confident.
 
-### 5.6 HRM-L micro-experts (optional)
+#### 5.5.1 Multi‑token prediction head (optional; later)
 
-We can replace the single GRU cell in HRM-L with 3–4 tiny GRU cells and a per-token router (top-1) inside the inner loop.
+An optional **MTP head** predicts the next (m) bytes jointly:
 
-* Adds Switch-style load-balance + z-loss locally.
-* Toggleable per milestone (OFF by default; considered in experiments).
+* **Placement:** parallel to the ByteHead over (hL_{\text{mod}}).
+* **Training:** teacher forcing with a joint cross‑entropy on (m) future bytes; small loss weight.
+* **Constraints:** fixed small (m) (e.g., 2–4) with pre‑allocated projection matrices; no autoregressive graph changes.
+* **Ablation:** enable only for a small, budgeted run; carry forward only if quality/latency trade‑offs are favorable.
+
+### 5.6 HRM‑L micro‑experts (variant‑gated)
+
+**MoirAI‑2.9B‑A0.9B:** **ON** by default (k = 3–4 tiny GRU cells; top‑1 router; capacity factor 1.25) with a **Δ step‑time ≤5%** guard; auto‑disable if exceeded.
+**MoirAI‑0.9B‑A0.3B:** **OFF** by default; enable only on targeted workloads that show net quality or step‑time benefit.
+Monitor local pick‑rates, outer‑step reductions, and net step‑time.
 
 ### 5.7 Dump head (introspection-only)
 
@@ -514,7 +538,7 @@ eL_t   = ExpertL(hL_{t-1})                              # top-1 expert from L ba
 hL̃_t  = hL_{t-1} + (s_type.attn        · s_layer.L) · DropPath(ctxL_t)
 hL̃_t  = hL̃_t    + (s_type.hrmL_expert · s_layer.L) · DropPath(eL_t)
 
-# GRU update (unchanged)
+# GRU update
 hL_t   = GRU_L(hL̃_t, hL_{t-1})
 
 # Shared fixed path (preserves per-cluster gate w_fixL)
@@ -537,6 +561,22 @@ hM_u += (s_type.hrmM_fixed · s_layer.M) · (w_fixM · FixedM(hM_{u-1}))
 
 **Global & FiLM** are handled as in §5.3.
 
+#### 5.8.1 Innovation‑modulated S‑REG clamp
+
+A runtime clamp modulates S‑REG application using AFA innovation while **leaving S‑REG parameters stop‑grad**:
+
+Let `innov_mean` be the per‑sequence EMA‑normalized innovation scalar from AFA (0 at low surprise; ↑ with surprise). Define
+
+[
+s_\text{eff} ;=; s \cdot \mathrm{clamp}!\Big(1 - \kappa_\text{mod}\cdot \mathrm{norm_innov},; [\alpha, 1]\Big),
+]
+
+with defaults **(\alpha = 0.5)** and **(\kappa_\text{mod}\in [0.0, 0.3])**. `norm_innov` is a z‑score of `innov_mean` computed with a **stop‑grad EMA** baseline. The clamp is **multiplicative** and applied only to the **applied scale**; the S‑REG parameters ( \theta ) do **not** receive gradients from this path.
+
+**Scope.** Apply to residual types that can destabilize early (e.g., `ffn_retrieve`, `film`, HRM fixed paths), and log the realized attenuation **(1 - s_\text{eff}/s)** for attribution audits. The clamp is disabled for GRU cores (they are never S‑REG‑scaled).
+
+**Safety.** The floor (\alpha) prevents over‑suppression under sustained surprise. When innovation is low, (s_\text{eff}\to s); when high, (s_\text{eff}) reduces smoothly toward (\alpha s).
+
 ---
 
 ## 6) Hierarchical experts and transplanted knowledge
@@ -552,7 +592,7 @@ Both use **top-1 routing** (capacity factor 1.25). Both use Switch-style load ba
 
 Each HRM cluster has its own **HRM-L** and **HRM-M** expert banks. Banks are **not shared across clusters**.
 
-### 6.1.0 HRM width rounding & recording policy
+#### 6.1.0 HRM width rounding & recording policy
 
 **Purpose.** Hardware‑friendly expert widths, static shapes, and reproducible configs.
 
@@ -579,12 +619,11 @@ def round_width(raw, min_width, pow2_tol=0.05, align=64, align_tol=0.02):
     return int(2 * round(raw / 2))
 ```
 
-### 6.1.1 HRM‑L (operates on v0; state width = d_L)
+#### 6.1.1 HRM‑L (operates on v0; state width = d_L)
 
-**Expert bank per cluster (top‑1): five size tiers + escape; multiplicities differ by variant.**
-Widths are computed from **§2.2** ratios using **§6.1.0** rounding.
+**Expert bank per cluster (top‑1): five size tiers + escape; multiplicities differ by variant.** Widths come from §2.2 via the rounding policy in §6.1.0.
 
-* **Q0.5B (d_L = 1920)** — **8 experts/cluster:**
+* **MoirAI‑0.9B‑A0.3B (d_L = 1920)** — **8 experts/cluster:**
 
   * **0.2667×:** **×4**
   * **0.50×:** ×1
@@ -592,7 +631,7 @@ Widths are computed from **§2.2** ratios using **§6.1.0** rounding.
   * **1.00×:** ×1
   * **1.25× (escape):** ×1
 
-* **Q1.5B (d_L = 3072)** — **6 experts/cluster:**
+* **MoirAI‑2.9B‑A0.9B (d_L = 3072)** — **6 experts/cluster:**
 
   * **0.3333×:** **×2**
   * **0.50×:** ×1
@@ -600,34 +639,20 @@ Widths are computed from **§2.2** ratios using **§6.1.0** rounding.
   * **1.00×:** ×1
   * **1.20× (escape):** ×1
 
-**Per‑expert wrapper:**
+**Per‑expert wrapper.** `In: d_L → d_e` → 2‑matrix MLP @ `d_e` → `Out: d_e → d_L` as a residual around GRU‑L.
+**Shared fixed path.** `FixedL_shared: d_L → d_L` (tied across clusters), applied with per‑cluster scalar gate `w_fixL_c`; anneal schedule is S‑REG/fragility‑aware (§6.1.7).
 
-* `In: d_L → d_e` → 2‑matrix MLP @ `d_e` → `Out: d_e → d_L`, used as a residual around GRU‑L.
+#### 6.1.2 HRM‑M (operates on v1; state width = d_M)
 
-**Shared fixed path (slower anneal):**
+**Expert bank per cluster (top‑1): five size tiers + escape; one of each per cluster (both variants).** Widths from §2.2 via §6.1.0.
 
-* `FixedL_shared: d_L → d_L` (width = **1.0×d_L**, tied across clusters).
-* Each cluster `c` applies `hL ← hL + w_fixL_c · FixedL_shared(hL_prev)`, with the existing scalar gate param (`a_c, b_c`).
-* **Anneal slightly slower during warm‑start** to stabilize wider states; removal/repurpose policy remains per §6.1.4.
+* **MoirAI‑0.9B‑A0.3B (d_M = 2880)** — 5 experts/cluster: { 0.2667×, 0.50×, 0.75×, 1.00×, 1.25× }
+* **MoirAI‑2.9B‑A0.9B (d_M = 4096)** — 5 experts/cluster: { 0.3333×, 0.50×, 0.75×, 1.00×, 1.20× }
 
-### 6.1.2 HRM‑M (operates on v1; state width = d_M)
+**Per‑expert wrapper.** `In: d_M → d_e` → 2‑matrix MLP @ `d_e` → `Out: d_e → d_M` as a residual around GRU‑M.
+**Shared fixed path.** `FixedM_shared: d_M → d_M`, per‑cluster gate `w_fixM_c`; anneal per §6.1.7.
 
-**Expert bank per cluster (top‑1): five size tiers + escape; one of each per cluster (both variants).**
-Widths from **§2.2** via **§6.1.0**.
-
-* **Q0.5B (d_M = 2880) — 5 experts/cluster:** { 0.2667×, 0.50×, 0.75×, 1.00×, 1.25× }.
-* **Q1.5B (d_M = 4096) — 5 experts/cluster:** { 0.3333×, 0.50×, 0.75×, 1.00×, 1.20× }.
-
-**Per‑expert wrapper:**
-
-* `In: d_M → d_e` → 2‑matrix MLP @ `d_e` → `Out: d_e → d_M`, residual around GRU‑M.
-
-**Shared fixed path (slower anneal):**
-
-* `FixedM_shared: d_M → d_M` (width = **1.0×d_L = d_M** when `d_M=1.5·d_L`; for Q1.5B we keep `FixedM_shared` at **d_M**).
-* Per‑cluster scalar gate `w_fixM_c` as before; **anneal slightly slower during warm‑start**.
-
-### 6.1.3 Routing, stability, and curricula (HRM‑L/M)
+#### 6.1.3 Routing, stability, and curricula (HRM‑L/M)
 
 * **Routing:** **top‑1** expert with capacity factor **1.25**.
 
@@ -673,60 +698,54 @@ Cluster scaling per model variant:
 
 We size clusters and fixed paths so HRM total params sit at ≳~¼ of FFN bank parameters.
 
-### 6.1.5 HRM parameter budget (HRM‑only; includes shared fixed paths)
+#### 6.1.5 HRM parameter budget (formulas & accounting)
 
-**Per‑expert model:** `P_expert ≈ 2·d_band·d_e + 2·d_e²`
-**Shared fixed paths:** `P_fixed ≈ 2·d_L² + 2·d_M²`
+Let `d_L, d_M` be the band widths, and `d_e` the rounded tier width.
 
-**Totals (for HRM only; all clusters; rounded):**
+**Per‑expert (two‑matrix MLP) approximate params:**
+[
+P_{\text{expert}} ;\approx; 2,d_{\text{band}},d_e ;+; 2,d_e^2.
+]
 
-* **Q0.5B (4 clusters):** **New ≈ 0.747B**, **baseline ≈ 0.255B** → **Δ ≈ +0.492B**.
-* **Q1.5B (6 clusters):** **New ≈ 2.355B**, **baseline ≈ 1.120B** → **Δ ≈ +1.235B**.
+**Shared fixed paths:**
+[
+P_{\text{fixed}} ;\approx; 2,d_L^2 ;+; 2,d_M^2.
+]
 
-Trimming multiplicity on larger tiers and using **64‑aligned escape widths** caps growth while achieving granularity targets (see §2.2).
+**Totals.** Sum across clusters, tiers, and multiplicities from §2.2. Report **total** params in §2 and track **active** params/token via routing logs (top‑1 experts, fixed‑path scales, FiLM and attention projections actually executed). Use the attribution and router telemetry to monitor how active compute evolves as anneal proceeds.
 
-### 6.1.6 Why this works (HRM sizes & rounding)
+#### 6.1.6 Why this works (HRM sizes & rounding)
 
 * **Small‑tier dominance** via power‑of‑two / 64‑aligned minima lifts average **granularity** (3.5 on Q0.5B; ~3.0–3.1 on Q1.5B) without exploding parameters.
 * **Five ratios per band** preserve routing flexibility; a **rare escape tier (>1.0)** gives headroom without dominating compute.
 * **Budgeted Q1.5B** lowers **M** band width (4096) and trims **L** multiplicity, cutting quadratic cost while preserving compile invariants and meeting **≥3× granularity**.
 * The rounding policy yields **hardware‑friendly** dimensions and **reproducible configs** (`ratio = rounded_width / band_width`), and pre‑tracing all shapes keeps **compile warm‑up** complete and fast.
 
+#### 6.1.7 Fixed‑path anneal scheduler (S‑REG‑driven; fragility‑aware)
+
+Anneal the shared fixed HRM paths using **attribution** and **fragility**:
+
+* **Attribution driver:** increase anneal rate when S‑REG shows routed paths contributing the majority of residual magnitude for the band; slow when fixed paths still carry significant share.
+* **Fragility score:** combine (i) donor alignment trend (L_{\text{align}}) and (ii) H‑Net stability signals (e.g., “hockey‑stick” health, chunk drift). High fragility pauses or slows anneal.
+* **Floor & safety:** maintain a floor on fixed‑path scale during warm‑start; never hard‑drop without a removal test (see §6.3).
+
 ### 6.2 FFN knowledge experts (transplanted)
 
 These are **knowledge / recall banks** attached to HRM-G. They are carved from donor dense models (Qwen by default, optional Mamba). Instead of fully retraining, we carve neurons, bake in donor gates, partially re-initialize slices to add diversity, and wrap them with adapters. Routing is a 3-tier hierarchy.
 
-### 6.2.1 Families, Layout, **Flattening**, and Donor Layer Priority
+#### 6.2.1 Families, layout, flattening & **data‑driven donor layer selection** [^5][^6]
 
-**Families.**
+**Families.** Each donor family contributes one **flattened global FFN bank** shared across the model. Family interfaces (shared (A_{\text{in}}, A_{\text{out}}) and donor LN stats) align donor activations to native widths.
 
-Each donor **family** (default: **Qwen**; optional: **Mamba**) contributes a **single, flattened, global FFN bank** shared across the model. A family shares one pair of adapters (`A_in: d_native→d_donor`, `A_out: d_donor→d_native`) and donor LayerNorm stats. There is **no per-trunk-layer FFN bank**: trunk layers *tap* the **same** family bank via tiny per-layer **site adapters** (see §7.4).
+**Data‑driven capture‑layer selection.** Rather than a fixed list, select donor layers by a calibrated score:
 
-**Flattening across donor layers.**
+* Compute per‑layer metrics on a calibration slice (10–50M tokens): neuron activation stats, **corr_with_high_token_codes**, domain‑conditioned entropies, and co‑activation structure.
+* Score layers by a weighted sum of semantic diversity, stability, and coverage; **choose the top‑S** under a budget (S) (typ. 9–13).
+* If instrumentation is unavailable, a **seed set** may be used to bootstrap; the calibrated selector supersedes the seed once metrics are available.
 
-We pool neurons from a **capture set** of donor FFNs and carve them into clustered experts:
+**Flattening across donor layers.** Pool neurons from captured layers, cluster into **K = 8** clusters per family, carve sub‑experts with limited neuron overlap, and bake donor gates into weights via gate‑compensation. Routing remains **family→cluster→expert (top‑1)**.
 
-1. **Capture set (default = extended):**
-   `capture_layers = {4, 6, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20}` (S=13)
-   *(Optional minimal set retained for budget reductions: {6, 8, 10, 12, 13, 14, 16, 18, 20}, S=9.)*
-
-2. **Neuron pool:** `𝒥_family = ⋃_{ℓ∈capture_layers} J_ℓ`.
-
-3. **Clustering & carving:** K=8 clusters per family; within each cluster, carve sub-experts `E_{c,i}` as neuron subsets `J_{c,i}` with **overlap capped at ρₒᵥ ≤ 0.15**.
-
-4. **Gate-compensation:** bake donor gate means `s_{j,c}` into `W_up` columns; drop donor gates at runtime.
-
-5. **Exposure:** HRM-G retrieves via **family→cluster→expert routing**; trunk taps the same bank through **site adapters** (§7.4).
-
-**Donor priority & metadata.**
-
-We still prioritize mid→late donor layers (as listed) for semantic diversity. Each carved neuron carries `(donor_layer_id, neuron_id)` metadata for analysis and curricula.
-
-**Budgeting note (new defaults).**
-
-For parameter budgeting and counts below, we use a mild uplift in donor FFN expansion **`f_d = 6·dₙ`** (vs ~5.8× before). This is a conservative “donor class” assumption and only affects **counts**, not shapes or training code.
-
-#### 6.2.2 Calibration & carving (per family) [^5][^6]
+#### 6.2.2 Calibration & carving (per family)
 
 Step-by-step:
 
@@ -747,35 +766,21 @@ Step-by-step:
 
 (We can optionally run a cheap least-squares fit on a small calibration slice to refine `s_{j,c}` after transplant.)
 
-#### 6.2.3 Partial re-initialization (diversity injection)
+#### 6.2.3 Partial re‑initialization (diversity injection) — schedule & guardrails
 
-We don’t want each carved expert to be an identical donor shard. We inject controlled novelty:
+Initial refresh fraction **(\rho_{\text{applied}}=0.05{-}0.10)** per expert (default **0.10**). Maintain a **default long‑term target (\rho_{\text{target}}=0.20)** and **optionally** raise to **0.25 only if** the *diversity MoE tier is disabled* (§6.2.10) **and** the transplant remains stable under the guardrails below.
 
-Inputs per expert `(c,i)`:
+**Top‑up rule (in +0.05 steps).** Increase only when **all** hold within the last 5k–10k steps:
+(a) alignment improves (downward slope in (L_{\text{align}})),
+(b) S‑REG attribution to routed paths is stable (no persistent drift in contribution shares),
+(c) dev perplexity spike ≤ **0.2%** over a 2k‑step window,
+(d) router overflow ≤ **5%** and dead‑expert ≤ **10%** (tier‑level EC fallback not persistently engaged).
 
-*   Neuron indices `J_{c,i}`, size `f_i`.
-*   Gate scales `s_{j,c}`.
-*   Donor per-neuron activation/weight stats.
+**Floor for tiny experts.** Refresh at least `max(32, ceil(0.05·f_i))` neurons so even small experts gain plasticity.
 
-Procedure:
+**Never refresh** the family’s **fixed** FFN expert; that path is reserved for stabilization/repurpose (§6.3) and as the value‑cache anchor (§8.3).
 
-1.  Randomly choose a subset `I_{c,i} ⊂ J_{c,i}` of size `ρ_applied · f_i`.
-    *   Long-term target `ρ_target = 0.25`.
-    *   At initial transplant we only apply `ρ_applied = 0.10`.
-    *   Guarantee floor `min_cols = max(32, ceil(0.05 · f_i))` so even tiny experts get some refresh.
-2.  For each neuron `j ∈ I_{c,i}`:
-    *   Estimate donor `(μ_{W1,j}, σ^2_{W1,j})` for the up-projection column, `(μ_{W2,j}, σ^2_{W2,j})` for the down row.
-    *   Sample new `W1'[:, j] ~ Normal(μ_{W1,j}, σ^2_{W1,j})`.
-    *   Sample new `W2'[j, :] ~ Normal(μ_{W2,j}, σ^2_{W2,j})`.
-    *   Reapply cluster scale:
-        `W1'[:, j] ← s_{j,c} · W1'[:, j]`.
-    *   Record a boolean mask `M_{c,i}[j] = 1` for refreshed neurons.
-3.  We **never** partially re-initialize the family's global fixed FFN expert; that one stays as a conservative donor anchor.
-4.  Optimizer groups:
-    *   Refreshed rows/cols get different LR / warmup than retained donor rows/cols.
-    *   We can “push” the refreshed slice harder without instantly wrecking donor knowledge.
-
-We top up this refresh fraction toward `ρ_target = 0.25` later (Milestone M5).
+Optimizer grouping: refreshed rows/cols use a higher LR multiplier than retained donor rows/cols; both follow the main schedule’s warm‑up/decay.
 
 #### 6.2.4 Fixed FFN expert (per family)
 
@@ -819,15 +824,13 @@ We route in three tiers, then optionally add the fixed expert residual:
 
 When innovation-based routing bias is enabled (see §7.2.1), we increase MoR’s reliance on the query head (vs prior) for high-innovation spans.
 
-#### 6.2.6 Adapters & alignment to HRM widths [^23]
+#### 6.2.6 Adapters & alignment — **gains‑then‑biases** policy [^23]
 
-Each expert `E_{c,i}` is wrapped with per-expert adapters for HRM integration:
+Adapters (A_{\text{in}}, A_{\text{out}}) and donor LN stats align donor to native widths. If **(L_{\text{align}})** stalls for >1 epoch:
 
-*   `A_in^{(e)}: d → f_i`
-*   Expert MLP of width `f_i`
-*   `A_out^{(e)}: f_i → d`
-
-We also copy donor LayerNorm / mixer norm gain+bias and initially freeze them to preserve donor activation scale. If the `L_align` loss stalls >1 epoch, we unfreeze **only the LN gains** (not biases) to let us rescale without wrecking centering. These LN gains are also limited-scope knobs we may adjust later (M5).
+1. **Unfreeze LN gains** (biases remain frozen) to rescale without recentering.
+2. If still stalled after another epoch, **unfreeze LN biases** with a strict LR multiplier (0.1×) and an L2 penalty.
+3. **Re‑lock** if donor centering drifts beyond **2σ** of the calibration stats.
 
 #### 6.2.7 Summary of transplant pipeline
 
@@ -840,7 +843,7 @@ For each donor family (e.g. Qwen), for each cluster `c`, for each expert `E_{c,i
 5.  **Register routing hooks** with the 3-tier router (family→cluster→expert).
     Routing uses top-1 at every tier plus a low-weight fixed expert residual. Capacity factor is 1.25. All stabilized with Switch-LBL α=0.02→0.01→0.005, z-loss=1e-3, τ 1.2→1.0, router noise 1.0→0.2.
 
-### 6.2.8 Per-Layer **Site Adapters** & **Layer-ID Scales (S-REG-LID)** for Trunk Taps
+#### 6.2.8 Per-Layer **Site Adapters** & **Layer-ID Scales (S-REG-LID)** for Trunk Taps
 
 Trunk layers can “tap” the global family bank (UMoE-lite; see §7.4) using **site adapters** and **layer-ID scales**:
 
@@ -875,105 +878,68 @@ y_tap(ℓ)  ←      [ s_type.umoe_tap · s_band.attn_tap · s_lid.attn_tap[ℓ]
 
 All adapters and scales are scalar or diagonal; shapes are static; routers and DSA K-buckets are unaffected.
 
-### 6.2.9 Parameter accounting, **defaults**, and “non-HRM/associated” totals
+#### 6.2.9 Parameter accounting, defaults, and non‑HRM totals
 
 Let
 
-* `dₙ` = native trunk width (Q0.5B: **896**; Q1.5B: **1536**)
-* `f_d` = **donor FFN expansion for budgeting**, set to **`6·dₙ`** by default
-* `S` = number of **captured donor layers** (**13** by default; optional 9)
-* `η` = carve fraction over captured donor mass (**`0.60`** default)
-* `ρₒᵥ` = max neuron overlap between carved experts (**`0.15`** default)
-* `L_tap` = number of tapped trunk layers (Q0.5B default **2**; Q1.5B default **4**)
-* `L_trunk` = trunk depth (Q0.5B **24**; Q1.5B **28**)
+* `d_n` = native trunk width (MoirAI‑0.9B‑A0.3B: **896**; MoirAI‑2.9B‑A0.9B: **1536**)
+* `f_d` = donor FFN expansion for budgeting (**`6·d_n`** default)
+* `S` = number of captured donor layers (default **13**; optional 9)
+* `η` = carve fraction over captured donor mass (default **0.60**)
+* `ρ_ov` = max neuron overlap between carved experts (default **0.15**)
+* `L_tap` = number of tapped trunk layers (typ. **2** for MoirAI‑0.9B‑A0.3B; **4** for MoirAI‑2.9B‑A0.9B)
+* `L_trunk` = trunk depth (**24** and **28** respectively)
 
-**Reference donor FFN mass across captured layers (per family):**
+**Donor FFN mass across captured layers (per family):**
+[
+P_{\text{donor_FFN}} = 2,S,d_n,f_d.
+]
 
-```text
-P_donor_FFN = 2 · S · dₙ · f_d
-```
+**Transplanted family bank (per family):**
+[
+P_{\text{bank}} ;\approx; \big(\eta \cdot (1+\rho_{ov})\big),P_{\text{donor_FFN}}.
+]
 
-**Transplanted shared family bank (per family):**
+**Family interfaces (shared (A_{\text{in}}, A_{\text{out}}) + donor LN):**
+[
+P_{\text{family_ifaces}} ;\approx; 2,d_n^2.
+]
 
-```text
-P_bank ≈ (η · (1 + ρₒᵥ)) · P_donor_FFN
-```
+**UMoE‑lite site adapters (diag+bias in/out for fixed+routed) per tapped layer:**
+[
+P_{\text{site_per_layer}} \approx 8,d_n,\qquad
+P_{\text{site_total}} \approx (8,d_n),L_{\text{tap}}.
+]
 
-**Family interfaces (shared A_in/A_out + donor LN):**
+**Routing prototypes (family + clusters):**
+[
+P_{\text{router_proto}} \approx (1+K),d_n \quad (K=8).
+]
 
-```text
-P_family_ifaces ≈ 2 · dₙ · dₙ    # LN terms are O(dₙ), negligible
-```
+**Trunk attention projections (all layers):**
+[
+P_{\text{trunk}} \approx L_{\text{trunk}},(4,d_n^2).
+]
 
-**UMoE-lite site adapters (diag+bias in/out for fixed+routed) per tapped layer:**
+**Non‑HRM subtotal (per family):**
+[
+P_{\text{nonHRM}} \approx P_{\text{trunk}} + P_{\text{bank}} + P_{\text{family_ifaces}} + P_{\text{site_total}} + P_{\text{router_proto}}.
+]
 
-```text
-P_site_per_layer ≈ 8 · dₙ
-P_site_total     ≈ (8 · dₙ) · L_tap
-```
+Use these expressions to reproduce the totals reported in §2 and to sanity‑check variant deltas when adjusting `S, η, ρ_ov, L_tap`.
 
-**Routing prototypes (small, included explicitly):**
+#### 6.2.10 Diversity MoE tier (optional)
 
-```text
-P_router_proto ≈ (1 + K) · dₙ   # family + K clusters, K = 8 ⇒ ≈ 9 · dₙ
-```
+As an alternative to heavy partial re‑init, attach **1–2 tiny “diversity experts”** (≈0.1× width) per cluster with a small router bias (~10%). Anneal the bias toward 0 as they specialize. Disable if **Δ step‑time >3%** without measurable perplexity gains.
 
-**Total per family (FFN bank + adapters + routers):**
+### 6.3 Fixed experts policy (scaffold → **repurpose** by default) [^7]
 
-```text
-P_total_family ≈ P_bank + P_family_ifaces + P_site_total + P_router_proto
-```
+Shared fixed paths (HRM‑L/M) and the per‑family fixed FFN expert begin as stabilizers and are **repurposed by default**:
 
-**Trunk attention projections (non-HRM, all layers):**
-
-```text
-P_trunk ≈ L_trunk · (4 · dₙ²)   # Q,K,V,O projections; backend extras are ≪ and omitted
-```
-
-**“Non-HRM/associated” total (what you asked for):**
-
-```text
-P_nonHRM_total ≈ P_trunk + P_total_family
-```
-
-#### Defaults & example counts (using S=13, η=0.60, ρₒᵥ=0.15, f_d=6·dₙ)
-
-* **Q0.5B** (`dₙ=896`, `f_d=5376`, `L_trunk=24`, `L_tap=2`)
-
-  * `P_donor_FFN`  ≈ **125.24 M**
-  * `P_bank`       ≈ **86.42 M**
-  * `P_family_ifaces` ≈ **1.61 M**
-  * `P_site_total` ≈ **0.01 M**
-  * `P_router_proto` ≈ **0.01 M**
-  * **`P_total_family` ≈ 88.04 M**
-  * `P_trunk`      ≈ **77.07 M**
-  * **`P_nonHRM_total` ≈ 165.11 M**
-
-* **Q1.5B** (`dₙ=1536`, `f_d=9216`, `L_trunk=28`, `L_tap=4`)
-
-  * `P_donor_FFN`  ≈ **368.05 M**
-  * `P_bank`       ≈ **253.95 M**
-  * `P_family_ifaces` ≈ **4.72 M**
-  * `P_site_total` ≈ **0.05 M**
-  * `P_router_proto` ≈ **0.01 M**
-  * **`P_total_family` ≈ 258.74 M**
-  * `P_trunk`      ≈ **264.24 M**
-  * **`P_nonHRM_total` ≈ 522.98 M**
-
-> Notes: (i) Router/prototype and S-REG scalars are tiny vs. bank/trunk and either included above (prototypes) or intentionally omitted (S-REG) as **≪1%**. (ii) If you switch to the **minimal** capture set (S=9), totals scale **linearly** in S. (iii) Increasing `η` or `ρₒᵥ` beyond the defaults will grow `P_bank` proportionally; we cap `ρₒᵥ` at **0.15** to avoid degeneracy.
-
-### 6.3 Fixed experts policy (scaffold → fade or repurpose) [^7]
-
-We treat fixed experts (HRM-L/M fixed paths and per-family fixed FFN expert) as scaffolding:
-
-*   **Early:** they stabilize training, act as safety nets, and provide cheap fallback behavior.
-*   **Anneal:** we lower their weights as routed experts stabilize.
-*   **Removal test:** if zeroing the fixed paths causes ≤0.5% absolute drop on key dev metrics (ARC, Sudoku, logic grids, etc.), and fixed-share usage is <20%, we keep them off.
-*   **Repurpose option:** if removing hurts >0.5%, we switch to “repurpose” mode:
-    *   Freeze routed experts.
-    *   Train the fixed path / fixed expert via reverse-KL + orthogonality.
-    *   Only unfreeze their tiny adapters/LN gains.
-    *   Make them become cheap distilled summary experts.
+* **Repurpose default.** Train small adapters/LN gains on the fixed module using reverse‑KL and orthogonality to make it a **summary expert**. The fixed FFN expert also serves as the **basis for the value‑cache surrogate** (§8.3).
+* **Removal only when unequivocally safe.** If the “fixed share” is <20% for a sustained window and forcing all fixed gates to zero causes ≤0.5% absolute drop on key dev metrics, keep them off; otherwise, keep repurposed.
+* **Compile safety.** Enabling/annealing/removing fixed paths never changes shapes; dispatch stays top‑1 everywhere.
+* **Emergency bypass.** A debug mode can bypass per‑cluster gates and apply only the type scale (e.g., (s_{\text{type.ffn_fixed}})) to simplify attribution.
 
 ### 6.4 Expert & fixed-path scaling policy
 
@@ -993,6 +959,14 @@ HRM-L/M expert residuals are always wrapped by S-REG as in §5.8. Size-tier comp
 **Fixed paths (HRM-L/M).**
 S-REG multiplies the contribution **after** the per-cluster scalar gates `w_fix{L,M}`: it does not alter gate anneal schedules or the remove vs repurpose decision flow.
 
+### 6.5 S‑REG‑guided freezing and pruning policy
+
+Use S‑REG attribution telemetry to optimize capacity:
+
+* **Freeze** modules with consistently low impact (scales near 0 and minimal contribution share) to save training updates.
+* **Mark for pruning** at the next static re‑compile window (e.g., M5‑LC) when a module’s contribution remains negligible across evaluation suites.
+* **Emergency bypass.** For fixed FFN paths and fixed HRM paths, a **clear‑glass** mode can bypass gates and apply only the type scale (e.g., (s_{\text{type.ffn_fixed}})) to debug attributions.
+
 ---
 
 ## 7) Attention, Mixing, Stability, and Long-Context Strategy
@@ -1003,34 +977,34 @@ MoirAI's attention is not monolithic. It is a hierarchical system with different
 
 These presets define the default mix of attention mechanisms across the trunk layers. They provide a reproducible recipe for balancing local processing, cheap global updates, and powerful but sparse global reasoning. They serve as reference starting points for the per-layer backend registry.
 
-#### 7.1.1 Shared Runtime Knobs and Mechanism Definitions
+#### 7.1.1 Shared runtime knobs and mechanism definitions
 
 ```yaml
 attn_runtime:
   mods_default:
-    silm: false             # enable per §7.2.2 if trunk dotprod/DSA layers need scale-invariant sparsity
+    silm: false             # enable at M5‑LC on trunk dotprod/DSA per §7.2.2
     ssa:
-      enabled: true         # per-query temperature (see §7.2.5)
+      enabled: true         # per‑query temperature; clamped; see §7.2.5
       base_tau: 1.0
       min_tau: 0.6
       max_tau: 1.4
-    ga: true                # head-gated attention (see §7.2.3)
+    ga: true                # head‑gated attention; defaults per §7.2.3
 
   verify_bump:
     enabled: true
-    conf_threshold: 0.25    # when sequence confidence < threshold, apply verify path
-    max_bumps: 3            # at most this many K escalations (power-of-two increments)
-    verify_bump_max_k: 4096 # hard ceiling for DSA K during verify path (see §10.1.4)
-    fallback_if_capped: power  # if already at ceiling, fall back to cheaper global mix
+    conf_threshold: 0.25
+    max_bumps: 3
+    verify_bump_max_k: 4096
+    fallback_if_capped: power
 
 mechanisms:
-  sw:         { window: 1024, dilation: 1, nonlinearity: softmax }
-  sw_dilated: { window: 1024, dilation: 2, nonlinearity: softmax }
-  sw_sigmoid: { window: 1024, dilation: 2, nonlinearity: sigmoid }
+  sw:         { window: 1024, dilation: 1,  nonlinearity: softmax }
+  sw_dilated: { window: 1024, dilation: 2,  nonlinearity: softmax }
+  sw_sigmoid: { window: 1024, dilation: 2,  nonlinearity: sigmoid }
 
   linear:
     feature_map: elu_plus_one
-    stable_sum: true
+    stable_sum: true        # numerically stable reductions; see §7.2.7
 
   power:
     rank: 128
@@ -1042,15 +1016,35 @@ mechanisms:
       mode: length_scaled_power2
       k_min: 256
       k_max: 2048
-      depth_mult:
-        early: 0.9
-        mid:   1.0
-        late:  1.2
-
+      depth_mult: { early: 0.9, mid: 1.0, late: 1.2 }
     indexer: tiny_mlp
     bias_with_silm: true
     sdpa_kernel: flash
+
+positional:
+  # Exactly ONE of the following must be true when long‑context is enabled.
+  # Selection is frozen at M5‑LC and remains immutable for the run.
+
+  hybrid_rope_nope:
+    enable: true            # 3/1 RoPE/NoPE across trunk depth (see §10.1.5)
+    qk_norm: { enable: true, eps: 1e-6 }
+    theta_scale: { enable: false, factor: 1.0 }
+
+  rotary_fraction:          # Alternative to the 3/1 pattern
+    enable: false           # set true ONLY if replacing hybrid_rope_nope
+    fraction_qk: 0.25       # apply RoPE to the first 25% of Q/K head dims
+    qk_norm: { enable: true, eps: 1e-6 }
+
+guards:
+  - rule: "exactly_one(positional.hybrid_rope_nope.enable, positional.rotary_fraction.enable)"
+  - rule: "ssa_disabled_where_sigmoid"    # SSA may not run on sigmoid attention layers
+  - rule: "immutable_registry_after_M5LC" # backends/positional are frozen post‑compile
 ```
+
+**Notes.**
+
+* The **rotary_fraction** option (RoPE on the first 25% of Q/K dims) is a *mutually exclusive* alternative to the 3/1 RoPE/NoPE pattern. Select **one** at M5‑LC based on ablations at equalized compute; freeze thereafter.
+* QK‑Norm remains enabled in either scheme to stabilize logits under fp16/bf16 (§11.1).
 
 #### 7.1.2 28-Layer Preset (6 DSA Layers)
 
@@ -1122,37 +1116,53 @@ model:
     - { id: 24, type: dsa,        note: "last-layer global (DSA)" }
 ```
 
-### 7.1.4 Layer-ID Scale Tables (Trunk 24/28)
+#### 7.1.4 Layer‑ID Scale Tables (24/28‑layer trunks)
 
-We provide concrete **initializations** for the new layer-ID scales `s_lid.attn[ℓ]` and `s_lid.attn_tap[ℓ]`. They are **learned** (softplus-param) and combine multiplicatively with your `type_priors` and `per_layer` (band) scales.
+Layer‑ID scale initializations for `s_lid.attn[ℓ]` and `s_lid.attn_tap[ℓ]` are **learned** (softplus‑param) and combine multiplicatively with type and band scales. Indexing is **1‑based**.
 
-> Indexing is **1-based** to match §7.1 presets.
-
-**(A) 24-Layer Trunk (matches §7.1.3)**
-
-* DSA at layers **3, 7, 12, 20, 24** → start a bit higher.
-*Proposed tapped layers for UMoE-lite (defaults): **[10, 14]***.
+**(A) 24‑Layer Variant — MoirAI‑0.9B‑A0.3B (matches §7.1.3)**
 
 ```yaml
 scales:
   layer_id:
     trunk:
-      attn:      [0.50, 0.50, 0.60, 0.50, 0.50, 0.50, 0.60, 0.52, 0.53, 0.55, 0.53, 0.60, 0.53, 0.53, 0.55, 0.52, 0.53, 0.53, 0.50, 0.60, 0.50, 0.52, 0.50, 0.60]
-      attn_tap: [0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00]
+      attn:      [0.50, 0.50, 0.60, 0.50, 0.50, 0.50, 0.60, 0.52, 0.53, 0.55, 0.53, 0.60,
+                  0.53, 0.53, 0.55, 0.52, 0.53, 0.53, 0.50, 0.60, 0.50, 0.52, 0.50, 0.60]
+      attn_tap:  [0.00, 0.00, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00,
+                  0.00, 0.35, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00]
 ```
 
-**(B) 28-Layer Trunk (matches §7.1.2)**
-
-* DSA at **3, 7, 14, 20, 26, 28**. Power at **12, 17, 25** → slightly elevated.
-* Proposed tapped layers: **[6, 12, 18, 24]**.
+**(B) 28‑Layer Variant — MoirAI‑2.9B‑A0.9B (matches §7.1.2)**
 
 ```yaml
 scales:
   layer_id:
     trunk:
-      attn:      [0.50, 0.50, 0.60, 0.50, 0.50, 0.50, 0.60, 0.50, 0.53, 0.55, 0.53, 0.55, 0.53, 0.60, 0.53, 0.53, 0.55, 0.52, 0.53, 0.60, 0.50, 0.52, 0.50, 0.52, 0.55, 0.60, 0.50, 0.60]
-      attn_tap:  [0.00, 0.00, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.00]
+      attn:      [0.50, 0.50, 0.60, 0.50, 0.50, 0.50, 0.60, 0.50, 0.53, 0.55, 0.53, 0.55,
+                  0.53, 0.60, 0.53, 0.53, 0.55, 0.52, 0.53, 0.60, 0.50, 0.52, 0.50, 0.52,
+                  0.55, 0.60, 0.50, 0.60]
+      attn_tap:  [0.00, 0.00, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.00, 0.00, 0.35,
+                  0.00, 0.00, 0.00, 0.00, 0.00, 0.35, 0.00, 0.00, 0.00, 0.00, 0.00, 0.35,
+                  0.00, 0.00, 0.00, 0.00]
 ```
+
+#### 7.1.5 Rotary‑fraction option (25% dims) [^13]
+
+An alternative positional scheme applies **RoPE to the first 25% of head dims** per attention head, with the remaining dims unpositioned (NoPE) and **QK‑Norm** enabled.
+
+**Configuration.**
+
+```yaml
+positional:
+  rotary_fraction:
+    enable: true
+    frac: 0.25
+    qk_norm: {enable: true, eps: 1e-6}
+```
+
+**Mutual exclusivity.** This option is **mutually exclusive** with the trunk’s hybrid 3/1 RoPE/NoPE layer pattern (see §10.1.5). Choose one scheme per run.
+
+**Adoption criteria.** Run an ablation at matched compute against the hybrid 3/1 scheme on long‑context evaluations; **adopt only if** length‑generalization and stability **match or exceed** the hybrid pattern. Once selected at the long‑context compile milestone, the positional scheme is **frozen** for the run.
 
 ### 7.2 Attention Backends and Stability Knobs
 
@@ -1187,76 +1197,23 @@ Hooks:
 Milestones:
 - Enable on HRM-L first in blend mode during M3 (ramp α from 0.2→0.7); extend to HRM-M in M4 only if M3 gains persist.
 
-#### 7.2.2 SILM (Scale-Invariant Logit Modulation) [^9]
+#### 7.2.2 SILM (Scale‑Invariant Logit Modulation) — **enablement policy** [^9]
 
-A per-head logit post-processor before softmax that preserves local mass while maintaining scale-invariant sparsity as context grows. For a query at position i and a key at relative distance t = i − j ≥ 0, map raw logits L_t to:
+SILM runs as a per‑head logit post‑processor to improve length generalization.
 
-L_t' = a_t · L_t + m_t
+* **Where.** Apply on **trunk** layers that use **dot‑product** or **DSA** attention.
+* **When.** **Enable at M5‑LC** (the first long‑context compile) and freeze thereafter.
+* **Coupling with DSA.** Add the same distance bias to the DSA indexer score so pre‑selection aligns with post‑gather logits.
+* **Tests.** Require ≤0.5% loss delta at ≥16× context and no degradation in DSA top‑K recall.
 
-with
+#### 7.2.3 GA (Gated Attention) — defaults [^25]
 
-a_t = sqrt( 2 · [ log(t/τ + 1) − log α + β/α ] )
-m_t = −a_t^2 + β/α
+**Enable GA on both HRM‑L *and* HRM‑M by default.** Each head output is multiplied by a gate (g_h(q_h)\in(0,1)) after value mixing: (y_h\leftarrow g_h\cdot y_h).
 
-Defaults:
-- α = β = e^{0.5}
-- τ is the only extra hyperparameter; set per band (see Bands section below).
-
-Where it fits (by backend):
-- dotprod: apply to logits before softmax.
-- dsa: apply to logits after top-K gather; also bias the indexer (see DSA coupling below).
-- afa/sigmoid: you may treat L_t as pre-sigmoid logits if you choose to combine; in practice we use SILM on dotprod/DSA layers only.
-- power: not recommended (no explicit pairwise logits); emulate effects via SSA/GA if needed.
-
-Bands & H-Net compatibility:
-- v0 (low/bytes): distance in tokens. Default τ_v0 = 10.
-- v1 (mid/chunks): distance in v1-chunks. Default τ_v1 = 2.
-- v2 (high/chunks): distance in v2-chunks. Default τ_v2 = 1.
-- With ESE active (segments), measure t at the segment granularity and tune τ accordingly.
-
-DSA coupling (length-scaled top-K):
-- Add the same SILM distance bias m_t to the indexer score so pre-selection and post-gather logits stay consistent.
-- Optionally multiply the indexer score by a_t to maintain the same scale trend.
-
-Milestone placement:
-- Enable at M5-LC (first long-context run) on trunk layers that use dotprod or DSA. If your trunk uses Power attention only, skip SILM or run a short branch to compare.
-- Avoid late swaps; if you must change SILM usage mid-project, use late-swap shielding (see §8.4 and §10).
-
-Config (concise):
-```yaml
-silm:
-  enable: false
-  where: {trunk_layers: "all", hrm_l_layers: []}  # start trunk-only
-  alpha: 1.64872        # e^{0.5}
-  beta:  1.64872        # e^{0.5}
-  tau:
-    v0: 10              # tokens
-    v1: 2               # mid-chunks
-    v2: 1               # high-chunks / segments
-  clamp_t: {min: 0, max: null}   # optional hard cap on t
-backend_support:
-  dotprod: {apply: true}
-  dsa:     {apply_logits: true, bias_indexer: true}
-  power:   {apply: false}
-```
-
-Caveats & mitigations:
-- Over-regularization of near tokens if τ too small → increase τ (e.g., v0: 20) or set clamp_t.max.
-- Indexer misalignment (DSA) → always include the m_t bias in the indexer.
-
-Tests & monitors:
-- Length generalization: train at short length and evaluate at ≥16×; require ≤0.5% loss delta vs baseline at equal compute.
-- Local mass preservation: attention mass on last 100 v0 tokens stays within ±10% across context lengths.
-- DSA coherence: top-K recall for gold keys (debug) does not degrade with SILM on.
-- Stability: no rise in NaNs; logit means/vars follow intended log t trends.
-
-#### 7.2.3 GA (Gated Attention) [^25]
-
-A head-specific, query-conditioned gate g_h(q_h) ∈ (0,1) multiplies each head’s output after the attention value mix: y_h ← g_h · y_h. This reduces attention sink and stabilizes training.
-
-Where: enable on HRM-L by default (per §16 config). Consider enabling on HRM-M in M4 if M3 ablations show gains; keep HRM-G unchanged.
-With AFA/SSA: gate the blended/dot-prod/AFA output; GA is complementary to AFA and SSA.
-Config and regularization: see §11 and §16 (L1 on gate activations, gate_floor clamp, modest LR for gate params).
+* **Regularization.** L1 on gates (1e‑4) + **gate_floor=0.02** to prevent dead heads.
+* **Learning rate.** LR multiplier 0.5 for gate parameters.
+* **Compatibility.** GA composes with SSA (per‑query temperature) and with AFA blend mode; S‑REG scales the post‑gate residual as usual.
+* **Sink mitigation.** Expect first‑token mass reductions vs softmax‑only baselines (monitored in §12).
 
 #### 7.2.4 Attention Sink Mitigations (Sigmoid Attention & Logit Hygiene) [^20][^21] [^22]
 
@@ -1273,6 +1230,13 @@ If attention sink remains an issue, we have two additional tools for softmax-bas
 
 **What.** Instead of attending to all keys/values, DSA uses a lightweight indexer to select the **top-K** most relevant KVs for each query. `K` is scaled dynamically with sequence length and bucketed to a power of two for compile safety. A `dense_short_circuit` is used for very short sequences. This provides near-linear cost for global attention.
 
+#### 7.2.7 Precision caveats for linear / Power / DSA backends
+
+* **Default precision:** **fp16** with **dynamic loss scaling** and **QK‑Norm**.
+* **Stability aids:** explicit activation clamping in linear/Power/DSA; “logit hygiene” (centering, key‑bias decay, smooth clipping) for softmax‑based layers.
+* **Fallback:** If a module remains unstable under fp16, use **bf16** with fp32 accumulators for that module only; record the exception.
+* **FP8 experiments:** require QAT and explicit activation clamping; keep a softmax temperature floor.
+
 ### 7.3 Long-Context Strategy
 
 #### 7.3.1 ESE (External Segment Encoder)
@@ -1286,6 +1250,39 @@ As an alternative to DSA, **Power Attention** provides linear-cost global mixing
 #### 7.3.3 Hybrid Positional Encoding (Trunk) [^13]
 
 For better long-context extrapolation, trunk layers can use a hybrid positional encoding scheme: a repeating pattern of 3 layers with RoPE and 1 layer with NoPE, with QK-Norm applied to all trunk layers for stability.
+
+#### 7.3.4 Fourier positional embeddings (optional; later)
+
+**Scope.** Experimental **Fourier positional embeddings (FPE)** may be applied to **H‑Net internal encoders** (levels v0/v1/v2) or to **selected trunk layers** in a dedicated ablation branch.
+
+**Constraints & compile safety.**
+
+* Shapes are unchanged (FPE adds no sequence‑length–dependent parameters).
+* If enabled on the trunk, FPE replaces that layer’s existing PE for the entire run; switching mid‑run requires a late‑swap distillation shield (§8.4).
+* When enabled concurrently with hybrid RoPE/NoPE, FPE substitutes for the **NoPE** layers only (mutually exclusive with the rotary‑fraction option below).
+
+**Configuration (concise).**
+
+```yaml
+position:
+  fpe:
+    enable: false
+    where: { hnet_levels: [], trunk_layers: [] }  # e.g., trunk_layers: [9,13]
+    spectrum: {bands: 4, min_freq: 1e-4, max_freq: 1.0}
+    norm: {type: "layer", eps: 1e-6}             # keeps logits stable under fp16
+    gating: {enable: true, init: 0.2, l1: 1e-4}  # learned gate; anneals toward fixed use
+    freeze_after_m5lc: true                      # lock choice at the long-context compile
+```
+
+**Ablation policy.** Train a short branch with FPE on (a) v0/v1 only, (b) a small trunk subset, then carry forward **only** if long‑context retrieval does not regress and stability/latency remain within budget.
+
+#### 7.3.5 Rotary‑fraction option (25%) (mutually exclusive with 3:1 RoPE/NoPE)
+
+A trunk configuration can apply RoPE to the **first 25% of QK head dims** and use **NoPE + QK‑Norm** on the remainder:
+
+* **Mutual exclusivity:** cannot co‑enable with the 3‑in‑4 RoPE / 1‑in‑4 NoPE layer pattern.
+* **Decision point:** run a short M5‑LC ablation at **equal compute** versus the hybrid scheme; promote only if it **matches or improves** length generalization and stability.
+* **Freezing:** whichever positional scheme wins at M5‑LC is frozen for the run.
 
 ### 7.4 UMoE-lite — Shared FFN Knowledge Experts in Attention
 
@@ -1351,6 +1348,64 @@ y     = x + (s_type.attn · s_layer.attn) · DropPath(y_att)
 **UMoE-lite taps (if enabled).**
 Scale the tap residual as a whole: `y_att_tap ← (s_type.umoe_tap · s_layer.attn_tap) · y_att_tap`.
 
+### 7.7 Limited dynamic backend mixer (head‑scoped; dual‑exec)
+
+A small **head‑scoped** mixer may run **both** DSA and Power **on ≤10% of heads in ≤2 trunk layers**, producing an output
+[
+y = \lambda , y_\text{DSA} + (1-\lambda), y_\text{Power},
+]
+with a learned (\lambda\in[0,1]) predicted by a tiny MLP over per‑head features. An **entropy/L1 penalty** drives (\lambda) toward **near‑binary**, annealing to one backend.
+
+**Compute guard.** Enforce global **Δ step‑time ≤5%**; auto‑disable if exceeded. **Compile warm‑up** must trace both code paths for the selected layers/heads.
+
+**Stability aid.** An optional mimic loss stabilizes the chosen backend as (\lambda\to{0,1}).
+
+**Default.** **OFF** by default; enable only when ablations show consistent value within the compute guard.
+
+### 7.8 Attention‑only ablation baseline (external + internal) [^26]
+
+A two‑track baseline isolates trunk‑backend effects and, separately, the incremental value of HRM and MoirAI‑specific controls.
+
+**Track A — External attention‑only baseline (no HRM).**
+Use the *modded‑nanogpt* speedrun harness to train a 24‑layer attention‑only model (matching the MoirAI‑0.9B‑A0.3B trunk depth) at equalized FLOPs:
+
+* **Backends:** windowed/dilated SDPA, DSA (length‑scaled (K) with power‑of‑two buckets), and Power Attention (fixed state size (m)).
+* **Layout:** approximate MoirAI’s early/mid/late global anchor cadence with closest analogues.
+* **Learned→fixed selection (later/secondary):** add a per‑layer learned backend selector that **anneals to one** backend per layer (near‑binary entropy penalty). After anneal, re‑evaluate at equalized FLOPs.
+* **Outputs:** per‑layer backend preferences, long‑context scaling curves, and stability diagnostics.
+
+**Track B — Internal MoirAI ablations (compile‑safe).**
+Run within MoirAI with **UMoE‑lite taps OFF**, **AFA/SSA/GA OFF** (unless explicitly tested), and transplant features disabled:
+
+1. **HRM‑OFF trunk baseline:** set **outer_max=1** and disable HRM dispatch (no L/M recurrence). Compare SDPA vs DSA vs Power at equalized FLOPs using the per‑layer registry.
+2. **HRM‑ON trunk baseline:** enable HRM (standard L/M/G caps) while keeping MoirAI extras OFF. Measure the **incremental gain** vs HRM‑OFF for each trunk backend choice.
+3. **Limited dynamic mixer (head‑scoped; learned→fixed):** enable dual‑exec on ≤10% heads in ≤2 trunk layers with a near‑binary mixing coefficient (\lambda). Enforce **Δ step‑time ≤5%** and **compile warm‑up** for both paths; once (\lambda) saturates, **freeze** to the winning backend.
+
+**Carry‑forward policy.** Use Track A to shortlist backends; confirm in Track B under MoirAI’s compile constraints. Adopt **fixed** (or **learned→fixed**) backends only; **per‑token backend routing is out‑of‑scope** to preserve compile invariants and stable active‑parameter accounting (see §2.3). Results may promote the learned→fixed mixer to default for the shortlisted layers if cost stays within budget.
+
+#### 7.8.1 Attention‑only ablation — protocol & parity requirements
+
+To ensure fair attribution when comparing backends with the attention‑only baseline:
+
+* **Depth parity:** **24 layers** to match MoirAI‑0.9B‑A0.3B trunk.
+* **Compute parity:** equalize **FLOPs and KV memory** per step across SDPA (windowed/dilated), DSA, and Power settings.
+* **Data parity:** identical data order, seeds, and token budgets; three seeds minimum.
+* **Mechanism set:** begin with the **simplified** backend set; expand only if stable.
+* **Learned→fixed trial:** a per‑layer selector may be trained but must **anneal to one** backend per layer prior to final evaluation.
+* **Outcome gating:** MoirAI adopts only those backend choices that win under parity on length‑generalization and stability at ≤ baseline step‑time.
+
+### 7.9 Fourier Positional Embeddings (FPE) — optional experiment
+
+**Motivation.** Test whether **Fourier positional embeddings** improve stability or cross‑domain transfer for H‑Net internal encoders or trunk ablations.
+
+**Scopes.**
+
+* **H‑Net internal encoders:** apply FPE channels in the small 1D encoders per level; keep reverse‑lattice semantics unchanged.
+* **Trunk ablation branch:** swap RoPE/NoPE in a small layer subset with fixed FPE channels.
+
+**Constraints.** Static shapes; compile‑safe toggles; FPE channels sized from a predeclared set.
+**Ablation.** Compare against the hybrid RoPE/NoPE baseline at equal compute; carry forward only if length‑gen or stability improves without latency regression.
+
 ---
 
 ## 8) Efficiency, Compile Invariants, and Cached Retrieval
@@ -1372,13 +1427,15 @@ Re-compilation is expensive and avoided. It is permitted **only** at specific, p
 
 We use a **compile warm-up driver** to pre-trace all likely graph variants before training starts, exercising different THPL headers, DSA K-buckets, and verify path hooks to prevent runtime compilation lag.
 
-### 8.3 Expert Value Cache (FFN Retrieval Cache)
+### 8.3 Expert value cache (FFN retrieval cache) — policy
 
-To reduce latency, we maintain a **per-FFN-cluster low-rank cache**.
-*   For each cluster `c`, we learn a low-rank surrogate model `(A_c, B_c)` that approximates the pooled expert output from a query `q`.
-*   If a new query is close to the cluster's prototype (`‖q − μ_c‖ < τ`), we serve the cheap cached approximation instead of running the full expert MLP.
-*   The cache is updated via EMA whenever the full expert is run, keeping it synchronized.
-*   This is compile-safe, as the cache and its ops are all static-shape tensor operations.
+Each FFN cluster maintains a low‑rank surrogate ((A_c,B_c)) **tied to the repurposed fixed expert**. Serve the surrogate when queries are near the cluster prototype; **always attempt cache** before evaluating a second expert in the verify path.
+
+* **Error budget:** relative L2 ≤ **1%** when hit‑rate ≥70% on flagged queries; auto‑relax to **≤2%** if hit‑rate drops ≥10% vs baseline.
+* **Drift handling:** refresh ((A_c,B_c)) when the repurposed fixed expert shifts beyond threshold.
+* **Static shapes:** cache lookups and updates are tensorized and shape‑stable.
+
+* **Logging.** Track hit‑rate, error, and drift; auto‑disable on persistent budget violations.
 
 ### 8.4 Training Invariants & Late-Swap Shielding
 
@@ -1400,40 +1457,69 @@ Every sample is prefixed with a **fixed 64-byte Task Header Block (THB)** that e
 
 ### 9.1 Header Format (fixed 64 bytes + CRC16)
 
+The Task Header Block (THB) is a compact, **64‑byte** structure that encodes the authoritative runtime policy for each sample. H‑Net must not chunk across the header.
+
 ```text
-Bytes	Field	Type	Notes
-0–1	version	uint16	
-2	task_id	uint8	e.g., nl_chat, code_chat, sudoku_9x9, arc
-3	domain_id	uint8	e.g., math, logic, general, legal
-4	mode_flags	bitfield	verify_only, allow_abstain, creative, force_dense_attn
-5	halt_kind	uint8	0 = cosine_mlp, 1 = bce_no_extra_pass
-6	answer_head	uint8	0 = none, 1 = puzzle_fixed
-7	bptt_flag	uint8	0 = off, 1 = on (truncated BPTT request)
-8–11	answer_len	uint32	e.g., 81 for 9×9 Sudoku; 0 if unused
-12–15	ans_vocab_bits	uint32	log2 of vocab for puzzle head (e.g., 4 for ARC colors)
-16–17	outer_steps_max	uint16	cap on outer loops
-18–19	l_iters_max	uint16	cap for HRM-L inner loop
-20–21	m_iters_max	uint16	cap for HRM-M inner loop
-22	seq_mlp_allowed	uint8	0/1 flag enabling sequence-MLP expert eligibility
-23	payload_codec	enum (u8)	UTF8_NFC, PPM_P6, WAV_PCM16LE, etc.
-24	num_std	bit (u8)	1 if numeral standardization applied
-25	media_type	enum (u8)	0 = none, 1 = IMAGE, 2 = AUDIO (for ESE/media flows)
-26–31	media_meta	packed bytes	e.g., {w,h} or {sr,mono}, fixed offsets/bit-packing
-32–61	reserved	bytes	future compact fields (grid dims, language id, safety tier, etc.)
-62–63	CRC16(0..61)	uint16	integrity check; CRC fail → conservative fallback
+Bytes  Field                 Type        Notes
+0–1    version               uint16
+2      task_id               uint8       nl_chat, code_chat, sudoku_9x9, arc, …
+3      domain_id             uint8       math, logic, general, legal, …
+4      mode_flags            bitfield    verify_only, allow_abstain, creative, force_dense_attn
+5      halt_kind             uint8       0 = cosine_mlp, 1 = bce_no_extra_pass
+6      answer_head           uint8       0 = none, 1 = puzzle_fixed
+7      bptt_flag             uint8       0 = off, 1 = on (request truncated BPTT sprinkles)
+8–11   answer_len            uint32      e.g., 81 for 9×9 Sudoku; 0 if unused
+12–15  ans_vocab_bits        uint32      log2 of vocab for puzzle head (e.g., 4 for ARC colors)
+16–17  outer_steps_max       uint16      cap on outer loops
+18–19  l_iters_max           uint16      cap for HRM‑L inner loop
+20–21  m_iters_max           uint16      cap for HRM‑M inner loop
+22     seq_mlp_allowed       uint8       0/1 to enable the sequence‑MLP expert
+23     payload_codec         enum (u8)   UTF8_NFC, PPM_P6, WAV_PCM16LE, …
+24     num_std               uint8       1 if numeral standardization applied
+25     media_type            enum (u8)   0 = none, 1 = IMAGE, 2 = AUDIO (ESE/media flows)
+26–31  media_meta            6 bytes     packed (e.g., {w,h} or {sr,mono}); fixed offsets/bit‑packing
+32     halt_offset_q2        int8        inference‑time halter logit offset ×2 (step = 0.5); clamp to [+15] ≡ +7.5
+33     ffn_verify_k          uint8       allowed FFN top‑k used **inside verify only** (1 or 2; others ignored)
+34–61  reserved              bytes       future compact fields (e.g., language id, grid dims, safety tier)
+62–63  CRC16(0..61)          uint16      integrity check; CRC fail → conservative fallback
 ```
 
-Notes:
+**Encoding notes**
 
-H-Net must not chunk across the header; THPL exposes header fields as side-channel features.
+* `halt_offset_q2` is a signed 8‑bit fixed‑point value with **0.5** steps (e.g., `+10` ≡ `+5.0` logit offset). At runtime this is mapped to `policy.halt_offset = clamp(halt_offset_q2 / 2.0, 0.0, +7.5)` for compute‑sensitive tasks; the default is `0.0`.
+* `ffn_verify_k` applies **only** within the verify path; it leaves the main forward path’s static **top‑1** invariant untouched. Values other than `{1,2}` are ignored and treated as `1`.
 
-THPL sets mode_flags.force_dense_attn=true for small structured puzzle tasks that should force dense/windowed attention paths in DSA layers (see §10.1.3).
+**Guards**
 
-For media routed via ESE, THPL sets media_type and media_meta; raw media bytes are not sent to the trunk.
+* On CRC failure or malformed fields, THPL emits a conservative policy: dense/windowed attention on short puzzles, `halt_offset = 0.0`, and `ffn_verify_k = 1`.
+* The header is per‑sample; mixed batches are supported. Shapes remain static.
 
 ### 9.2 THPL Runtime Policy & Presets
 
-THPL decodes the header into a `Policy` struct for runtime use and provides sane presets for common tasks (e.g., `nl_chat`, `sudoku_9x9`). Global configs can only further restrict, not expand, the policy set in the header. For example, `policy.bptt_enabled = header.bptt_flag && cfg.allow_bptt`.
+THPL parses the 64‑byte header into a `Policy` object used by halters, routers, verify logic, and long‑context mechanisms.
+
+**Field mapping**
+
+* `policy.mode` from `mode_flags` (verify_only, allow_abstain, creative, force_dense_attn).
+* `policy.halt_kind` from `halt_kind`.
+* `policy.answer_head`, `policy.answer_len`, `policy.ans_vocab_bits`.
+* `policy.outer_max`, `policy.l_max`, `policy.m_max` from their respective caps.
+* `policy.seq_mlp_allowed` (0/1).
+* `policy.payload_codec`, `policy.num_std`, `policy.media_type`, `policy.media_meta`.
+* `policy.bptt_enabled = (bptt_flag == 1) && cfg.allow_bptt && (task_id ∈ cfg.bptt_tasks)`.
+* **Inference bias:** `policy.halt_offset = clamp(halt_offset_q2 / 2.0, 0.0, +7.5)`.
+* **Verify FFN fanout:** `policy.ffn_verify_k = (ffn_verify_k in {1,2}) ? ffn_verify_k : 1`.
+
+**Presets**
+
+* **nl_chat**: moderate outer cap, `halt_kind=cosine_mlp`, `verify_only` true, `halt_offset=0.0`, `ffn_verify_k=1`.
+* **puzzle_fixed** (Sudoku/ARC): `halt_kind=bce_no_extra_pass`, allow `halt_offset ∈ [0,+7.5]` for calibration; `ffn_verify_k=2` inside verify for low‑confidence spans; `force_dense_attn` set for short contexts.
+* **long_doc**: `payload_codec=UTF8_NFC`, ESE enabled by profile, verify path permitted with attention bump, `ffn_verify_k=1`.
+
+**Invariants**
+
+* Policy can **restrict** but not expand global safety limits (e.g., cannot exceed compile‑warmed DSA K buckets or outer caps).
+* All policy effects are shape‑stable: top‑k dispatch remains **1** in the main path; verify internals are pre‑allocated.
 
 ### 9.3 Header-gated Mechanisms
 
@@ -1445,28 +1531,17 @@ When `policy.answer_head == "puzzle_fixed"`, a specialized head is used instead 
 
 A sequence-mixing MLP expert is included in the HRM-L expert bank but is only **eligible** for routing when `policy.seq_mlp_allowed == true`. This provides specialized capacity for grid-like tasks (Sudoku, ARC) without affecting general-purpose ones.
 
-### 9.4 HRM Control: EMA, Evaluation Policy, and Auto-tuned Loop Caps
+### 9.4 HRM control: EMA, loop‑cap auto‑tuning, and inference bias [^28]
 
-Always-on EMA (HRM-only). We enable exponential moving averages for HRM-L/M/G modules and their routers/adapters. EMA is disabled for trunk attention and the transplanted FFN bank.
+**EMA.** Evaluate HRM L/M/G (and their routers/adapters) with EMA weights; trunk attention and FFN bank use raw weights.
 
-- Default EMA decays
-  - Small-data (puzzles): decay = 0.999
-  - Mixed/long-context phases: decay = 0.996
+**Auto‑tuned caps.** Raise a cap by +1 at the next epoch boundary when
+(a) >20% of samples hit the cap for 5k steps **or** (b) **mean usage ≥75%** of the cap over 20k steps.
+Lower by −1 if <1% hit the cap for 20k steps **and** mean usage <50%. Never change caps mid‑epoch.
 
-- Evaluation policy
-  - Evaluate with EMA weights by default in validation/eval loops.
-  - Save both raw and EMA weights in checkpoints to allow A/B regressions and emergency rollbacks.
+**Halting bias.** THPL may set **halt_offset** (default 0.0; clip to +7.5) to adjust continue logits **at inference**. Effects are profiled per task.
 
-- Loop caps & halting (header-gated + auto-tuning)
-  - Initial hard caps (outer_max, l_max, m_max) come from the THB (see §9.1–§9.2) and are enforced per sample.
-  - Auto-tuning:
-    - If >20% of samples hit a cap for 5k steps, raise that cap by +1 (clamped to global safety limits from THPL config) at the next epoch boundary.
-    - If <1% hit a cap for 20k steps and mean usage <50% of the cap, lower that cap by −1 (not below the global minimum) at the next epoch boundary.
-  - Log every change; never change caps mid-epoch.
-
-- Tests
-  - EMA swap test: EMA vs raw metrics are tracked; EMA must not regress unexpectedly.
-  - Auto-tune stability: cap adjustments do not oscillate; changes occur only at epoch boundaries.
+**Tests.** EMA swaps do not regress unexpectedly; cap adjustments do not oscillate; halt_offset changes precision/recall of halting as intended on target tasks.
 
 ### 9.5 Canonical Byte Policy (CBP)
 
@@ -1477,20 +1552,18 @@ THPL enforces a consistent byte policy for H-Net:
 
 Mixed batches are fine; each sample carries its own header; H-Net respects header boundaries.
 
-### 9.6 Compile warm‑up driver ("Path Exciter")
+### 9.6 Compile warm‑up driver (“Path Exciter”)
 
-To avoid first‑use stalls and preserve `torch.compile(dynamic=false)`, **pre‑trace** every expert **shape** and all verify‑bump buckets before training:
+Pre‑trace all static shapes and guarded paths before training to avoid first‑use stalls with `torch.compile(dynamic=false)`:
 
-1. **HRM expert shapes (all clusters, both bands):** route **once to each ratio** present for the active model.
+1. **HRM expert shapes (all clusters, both bands):** route once to every recorded ratio for the active variant (see §2.2 and §6.1.0).
+2. **FFN bank:** for each **family→cluster**, route once to **each carved expert** and once to the **fixed** expert; include value‑cache path and repurposed‑fixed surrogate projections.
+3. **DSA (K) buckets:** for every long‑context DSA layer, execute forwards that hit **all powers‑of‑two** (K) from (k_{\min}) up to **verify_bump_max_k**.
+4. **Limited dynamic mixer (head‑scoped):** for each enabled layer, warm up **both** backends (DSA and Power) on the **dual‑exec heads** and the **post‑anneal single‑backend** path.
+5. **THPL presets & verify path:** one micro‑batch per header preset (nl_chat, code_chat, sudoku_9x9, arc_30x30, bptt_demo) plus a forced **verify** case (span bunching, prototype two‑shot, **top‑2 FFN in verify**).
+6. **Micro‑batching:** keep tiny; routing **top‑1**; shapes static; buffers pre‑allocated for all verified paths.
 
-   * **Q0.5B:** `{0.2667×, 0.50×, 0.75×, 1.00×, 1.25×}` for **L** and **M** (rounded per §6.1.0; widths in §2.2).
-   * **Q1.5B:** `{0.3333×, 0.50×, 0.75×, 1.00×, 1.20×}` for **L** and **M** (rounded per §6.1.0; widths in §2.2).
-2. **FFN bank:** for each **family→cluster**, route once to **each carved expert** and once to the **fixed** expert.
-3. **DSA verify‑bump K‑buckets:** issue short forwards that hit **all powers‑of‑two** K in `[k_min, verify_bump_max_k]` per long‑context layer (see §10.1.4).
-4. **THPL presets & verify path:** one micro‑batch per header preset (nl_chat, code_chat, sudoku_9x9, arc_30x30, bptt_demo), plus a case that **triggers verify**.
-5. **Micro‑batches:** keep tiny; shapes static; routing **top‑1**.
-
-The warm‑up driver logs coverage and must report ≥95% of intended paths exercised before main training starts.
+**Coverage requirement:** report ≥95% of intended paths exercised (including dual‑exec heads and all DSA buckets) before main training starts.
 
 ### 9.7 Integration and Tests
 
@@ -1622,26 +1695,14 @@ This section covers how we scale to long contexts without blowing up cost. It un
 
 All mechanisms in this section are shape-stable and must be compile-friendly.
 
-### 10.1.1 External Segment Encoder (ESE) [^12]
+#### 10.1.1 External Segment Encoder (ESE) — enablement & verify fallbacks [^12]
 
-**What it is.**
-A small external encoder (4–6 layers, width ~512) run on 1–2 KB byte segments to produce a handful (t≤4) of `d_model`-dim latent vectors that stand in for those raw bytes in the trunk. Those latent vectors are aligned to trunk stats using a lightweight LN→Affine adapter. This slashes memory/time for very long documents and can be cached by `(doc_id, seg_idx, ESE_ckpt_hash, adapter_hash)`.
+ESE compresses long documents by segment→latent mapping with a small external encoder.
 
-**Training.**
-We distill from “full MoirAI on raw bytes,” matching:
-
-* byte-level logits (KL),
-* pooled global state `hG_pool`,
-* answer coverage for QA spans,
-* plus a rate–distortion penalty λ·t to hit a target avg latent count (default goal t̄≈2).
-
-**Runtime with verify path.**
-When confidence is low (see §14), we either:
-
-1. request a **residual latent** (rank-8-ish low-rank delta on top of the cached latent), or
-2. fall back to re-encoding that local span from raw bytes through H-Net for just that window (not the whole doc).
-
-These fallbacks are bounded (≤5% of segments) and preallocate buffers.
+* **Enablement.** For long‑doc presets, **ESE is ON by default** at M5‑LC and frozen thereafter if it meets latency/quality targets.
+* **Training.** Distill from raw‑byte runs (KL on byte logits, pooled (hG), and QA coverage) with a rate–distortion term that targets (\bar{t}\approx 2) latents/segment.
+* **Verify fallbacks.** On low confidence, either request a **residual latent** (rank‑8) or re‑encode the span via H‑Net for that window. Bound to ≤5% of segments; preallocate buffers.
+* **Cache.** Latents are cached by ((\text{doc_id}, \text{seg_idx}, \text{ESE_ckpt_hash}, \text{adapter_hash})).
 
 ### 10.1.2 Power / Linear / Dense attention registry (Trunk & HRM-L)
 
@@ -1769,15 +1830,35 @@ When selective confidence (§14) flags low confidence, we allow one extra outer 
 - Because verify-bump can request K values up to verify_bump_max_k, torch.compile warm-up MUST pre-trace all powers-of-two K in [k_min, verify_bump_max_k] rather than [k_min, k_max], e.g., {256, 512, 1024, 2048, 4096} for long-context DSA layers.
 - verify-bump is used only in the verify path and only for flagged spans. Latency p95 on flagged spans must remain ≤15%.
 
-### 10.1.5 Hybrid positional encoding for trunk (RoPE / NoPE / QK-Norm)
+#### 10.1.5 Hybrid positional encoding for trunk (RoPE / NoPE / QK‑Norm)
 
-Long-context trunk layers may also use a hybrid positional scheme:
+Two **mutually exclusive** long‑context positional presets for the trunk:
 
-* “3/4 RoPE + 1/4 NoPE” pattern across trunk depth,
-* QK-Norm on all trunk attention layers for numerical stability,
-* optional θ-scaling if we extend beyond the training context.
+1. **Hybrid pattern** — a repeating *3‑of‑4 RoPE + 1‑of‑4 NoPE* scheme across depth, with QK‑Norm on all trunk attention layers.
+2. **Rotary fraction** — **RoPE on the first 25% of q–k head dims** (`rotary_fraction=0.25`), with the rest unpositioned (NoPE) but QK‑Normed.
 
-This hybrid positional encoding is frozen at the same compile milestone when we lock the attention registry. HRM bands keep their own positional/window rules; we *do not* silently port trunk’s positional tricks into HRM-L/M/G.
+Both are compile‑frozen at the first long‑context compile (M5‑LC). Promote `rotary_fraction=0.25` to default only if it **matches or exceeds** the hybrid pattern on length‑gen at equal compute (checkpointed at M5‑LC). θ‑scaling remains optional.
+
+##### 10.1.5.1 Rotary‑fraction alternative (0.25) — ablation & config
+
+As an alternative to the 3:1 **RoPE/NoPE** hybrid across trunk depth, test **per‑layer partial rotary** that applies RoPE to only the **first 25% of QK head dimensions** while leaving the remaining 75% NoPE/QK‑Normed.
+
+**Rules.**
+
+* **Mutual exclusivity:** do **not** combine with the 3:1 RoPE/NoPE pattern in the same run.
+* **Placement:** same trunk layers as the hybrid scheme; only the per‑head rotary fraction changes.
+* **Freeze timing:** choose at **M5‑LC** and freeze with the attention registry.
+* **Acceptance:** promote to default only if it **matches or exceeds** the hybrid scheme on ≥16× length generalization **at equal compute** and shows no stability regressions.
+
+**Minimal config knob.**
+
+```yaml
+long_context:
+  hybrid_positional:
+    mode: "rope_fraction"    # alternatives: "rope_nope_pattern"
+    rope_fraction_qk: 0.25    # RoPE on first 25% QK dims; remainder NoPE with QK-Norm
+    qk_norm: {enable: true, eps: 1e-6}
+```
 
 ### 10.1.6 Config knobs (long-context block)
 
@@ -1829,15 +1910,34 @@ long_context:
     theta_scale: {enable: false, factor: 1.0}
 ```
 
-### 10.2 Uncertainty Coupling, Verify QoL, and Config Guards
+#### 10.1.7 Fourier positional embeddings (FPE) — optional experiments
 
-#### 10.2.1 Coupling attention sharpness to uncertainty / innovation
+**Scope.** FPE may be evaluated as an **optional** replacement for positional encoding in two scopes:
 
-We modulate SSA temperature (τ) and head gates (g_h) based on AFA-derived innovation:
-- High innovation: decrease τ (sharpen), increase gate bias (allow heads to contribute more).
-- Low innovation: increase τ (flatten), decrease gate bias.
+1. **Trunk ablation branch** (selected layers only, registry‑frozen per §10.1.2), or
+2. **H‑Net internal encoders** (v0/v1/v2 1D blocks) where FPE replaces or augments the within‑level positional signal.
 
-Implementation: an EMA of low-innovation baseline μ_low; τ_eff = τ_base·exp(+κ_tau·(μ_low−innov_mean)) (clamped), and head-gate pre-sigmoid bias += κ_gate·(innov_mean−μ_low). Defaults κ_tau=κ_gate=0.2 on HRM-L; HRM-M off by default.
+**Compile invariants.** FPE adds only deterministic, shape‑stable features; no dynamic control flow. Kernel availability is not required; fall back to standard ops if a custom kernel is absent.
+
+**Adoption criteria.** Equalize compute vs the incumbent scheme and require **no worse than 0.5%** loss delta on long‑context tests with **no regressions** in H‑Net stability (target‑bits adherence, boundary entropy). Carry forward only if latency/VRAM is neutral or improved.
+
+### 10.2 SFT with reasoning traces (if available) [^29]
+
+When datasets provide **intermediate reasoning traces**, add a light auxiliary loss that supervises HRM global states (hG_t) (and, optionally, pooled L/M states) at each outer step:
+
+* **Signal.** Match to provided intermediate reasoning embeddings via cosine/L2 (weight 0.05–0.10).
+* **When.** Early SFT phases (M3/M4) and selected later milestones.
+* **Safety.** The auxiliary is purely latent; no exposure of traces in generated text; no change to compile invariants.
+* **Ablate.** Confirm improvements on multi‑step puzzles and long‑horizon NL tasks.
+
+#### 10.2.1 Coupling attention sharpness to innovation — defaults & decay
+
+Couple SSA temperature and GA bias to AFA innovation:
+
+* **HRM‑L defaults:** (\kappa_{\tau}=\kappa_{\text{gate}}=0.35).
+* **HRM‑M defaults:** (\kappa_{\text{gate}}=0.25). **(\kappa_{\tau}=0.25) applies only if SSA is enabled on HRM‑M; otherwise set (\kappa_{\tau}=0)** (GA‑only coupling).
+* **Clamps/EMA:** use a low‑innovation EMA baseline; bound modulation by per‑band clamps.
+* **Decay:** apply ≈20% cosine decay of (\kappa) by end of M4.
 
 #### 10.2.2 Verify path QoL improvements
 
@@ -1855,67 +1955,94 @@ Both are shape-stable and preallocated.
 
 Note: M6 and M7 are defined once in §10 (above); no additional milestone definitions appear here.
 
+#### 10.2.4 Reasoning traces during SFT (optional) [^29]
+
+When datasets provide latent reasoning signals, add a small auxiliary loss (0.05–0.10) that encourages (hG_t) (and optional pooled L/M states) to match provided intermediate embeddings at each outer step. This supervision is **latent‑only** and does not alter generated text.
+
 ---
 
-## 11) Optimizer & schedules
+## 11) Optimizer, precision & schedules
 
-* **AdamW**
+**AdamW:** β=(0.9,0.95), ε=1e‑8, weight decay 0.1, global grad clip 1.0.
+**LR schedule:** cosine decay with 5% warm‑up; LR multipliers: ×0.5 for family‑shared adapters at start.
 
-  * β=(0.9, 0.95), ε=1e-8
-  * weight decay 0.1
-  * global grad clip 1.0
-  * `bf16` everywhere feasible.
+### 11.1 Precision & numerics [^32][^33]
 
-* **LR schedule**
+* **Default:** **fp16** with **dynamic loss scaling** across the model.
+* **Numerically sensitive:** reverse lattice (H‑Net) computes in **fp32**; QK‑Norm on trunk attention layers.
+* **Heads & embeddings:** Byte logits are produced by **ByteHead** over HRM‑L; H‑Net replaces token embeddings.
+* **Fallback:** If a module is unstable in fp16, use **bf16** with fp32 accumulators for that module only; retain QK‑Norm and logit hygiene.
+* **Linear/Power/DSA:** use activation clamping (and QAT for FP8 experiments). Document any per‑module precision exceptions.
 
-  * cosine decay
-  * 5% warm-up
-  * smaller LR multiplier (×0.5) for family-shared adapters (`A_in`, `A_out`) at first, because we don’t want them to blow up donor scales.
+#### 11.1.1 Output head precision (ByteHead & puzzle answer head)
 
-* **Routers**
+**ByteHead.** Compute the final projection and logit accumulation in **fp32**; upstream activations may remain fp16.
+**Puzzle answer head.** When the fixed puzzle head is active, compute its projection/logits in **fp32**.
+**Reverse lattice.** Keep in **fp32**.
+These heads replace conventional “embedding/lm‑head” components (H‑Net supplies bytes; there is no separate token embedding).
 
-  * τ 1.2→1.0 over ~10k steps
-  * router noise std 1.0→0.2
-  * Switch-LBL α: 0.02→0.01→0.005
-  * z-loss: 1e-3
-  * capacity factor: 1.25
+#### 11.1.2 Precision mapping for MoirAI components
 
-* **Halting**
+The precision policy maps cleanly onto MoirAI’s modules, which lack a traditional “embedding” and “lm‑head” due to H‑Net and the ByteHead:
 
-  * halter MLP widen×4
-  * step penalty target λₒ = 0.01
-  * cosine veto auto-enabled if `outer_cap > 8`.
+* **Global default:** **fp16** with **dynamic loss scaling** and **QK‑Norm** on trunk attention. Backends using linear/Power/DSA apply explicit activation clamping; FP8 experiments require QAT and clamping (kept optional and isolated).
+* **Byte output head:** **ByteHead** (final logits over bytes) runs in **fp32** to match “lm‑head” stability expectations from dense LMs, then casts to fp16 for loss as needed.
+* **H‑Net stages:** the **reverse lattice** (byte reconstruction path) runs in **fp32**; the **boundary heads** may accumulate logits in fp32 with fp16 I/O to maintain numeric headroom around chunk boundaries.
+* **Fallback scopes:** if a specific attention layer or H‑Net stage proves unstable under fp16 despite QK‑Norm/logit hygiene, switch **that module** to **bf16 with fp32 accumulators**; record the exception in run metadata.
+* **Optimizers:** keep fp32 master weights/accumulators in AdamW for all modules; scale‑registry (S‑REG) parameters follow the module defaults but are cheap enough to compute in fp32 when co‑located with fp32 heads.
 
-* **Adapters alignment**
+### 11.2 Mixed‑BPTT & convergence guards
 
-  * alignment loss weight 0.01
-  * unfreeze donor LN gains if `L_align` stalls >1 epoch.
+**Across outer steps.** Training uses **truncated BPTT** across outer steps by default: gradients flow through the **final** outer step only.
 
-* **Convergence regularizer / one-step gradient**
+**Across inner loops.** Within the final outer step, **full gradients** flow through the HRM‑L and HRM‑M inner loops.
 
-  * OFF by default.
-  * We only enable them when we raise outer caps >4 (later milestones).
+**Prefix “sprinkle” passes.** To supply upstream credit without unbounded memory growth, periodically *sprinkle* non‑truncated passes:
 
-* **Gate regularization** (GA / head-gated attention)
+* With small, configurable probabilities per batch, enable gradients through the **first** outer step or the **first + second** outer steps;
+* Perform a backward pass, **clear gradients**, then run the final outer step and backward again;
+* Require activation checkpointing on outer‑step boundaries and auto‑throttle sprinkle rates on OOM sentinels.
+  All sprinkle counters and memory incidents are logged.
 
-  * L1 on head gates = 1e-4 to encourage sparsity and avoid attention sink.
-  * `gate_floor` clamp to 0.02 to avoid dead heads.
-  * Slightly slower LR (lr_mult 0.5) on gate params.
+**Convergence regularizer.** When outer caps exceed 4, apply a tiny penalty to discourage too‑rapid shrinkage of (\lVert\Delta h\rVert) (or excessive GRU Jacobian contraction). This combines well with the cosine‑veto option to prevent shallow convergence.
 
-### 11.1 Scale parameters (optimizer & schedule)
+**Caps & policy.** Train with **outer_max ≤ 16**; inference may allow higher caps when authorized by THPL policy, with budget logging (§5.4).
 
-**Optimizer group (S-REG).**
-All `θ` parameters for S-REG live in a dedicated group:
+### 11.3 Group‑specific regularization & losses
 
-* LR multiplier: **0.5** vs trunk default
-* Weight decay: **0.0** (optionally 1e-4 if you prefer shrinkage)
-* Soft barrier (optional): penalty `λ_scale · (max(0, s − s_max))²` with defaults `s_max=2.0`, `λ_scale=1e-3`
+* **GA gates:** L1 on gate activations (1e‑4), **gate_floor=0.02**, LR multiplier 0.5.
+* **S‑REG:** soft barrier with (s_{\max}=2.0), LR multiplier 0.5, and **weight decay 1e‑4** on S‑REG parameters.
+* **Adapters:** alignment loss on family adapters; orthogonality when repurposing fixed experts.
+* **Routers:** Switch‑LBL α schedule 0.02→0.01→0.005; z‑loss=1e‑3; capacity factor 1.25.
 
-**Warm-start schedule.**
-Freeze S-REG for the **first 2% tokens** of M1 (lets H-Net/HRM anchor). Unfreeze thereafter and train continuously across all milestones. No special LR warm-up needed beyond global schedule.
+### 11.4 ES fine‑tuning (optional, late‑phase) [^27]
 
-**Ablation guard (debug only).**
-A compile-time flag can zero `s_type.*` to verify attribution; this is for tests only and not part of normal training.
+Late‑phase **Evolution Strategies** fine‑tuning on small evaluation slices can optimize non‑convex knobs (gates, halter, S‑REG scales). Keep perturbations small, verify neutrality on held‑out sets, and roll back on regressions.
+
+### 11.5 S‑REG priors & (s_{\max}) rationale
+
+**Type priors (softplus‑param, multiplied with band and Layer‑ID scales):**
+
+| Type         | Prior (init) | Rationale                                      |
+| ------------ | :----------: | ---------------------------------------------- |
+| attn         |     0.45     | moderate initial residual from trunk attention |
+| ffn_retrieve |     0.35     | donor recall useful but not dominant early     |
+| ffn_fixed    |     0.25     | conservative fixed FFN path                    |
+| hrmL_expert  |     0.25     | keep L experts modest at boot                  |
+| hrmM_expert  |     0.30     | slightly higher to stabilize mid‑band          |
+| hrmL_fixed   |     0.35     | warm‑start stabilizer                          |
+| hrmM_fixed   |     0.35     | warm‑start stabilizer                          |
+| film         |     0.55     | FiLM must steer logits path reliably           |
+| umoe_tap     |     0.25     | small taps until alignment settles             |
+
+**Barrier.** A soft barrier enforces (s \le s_{\max}) with (s_{\max}=2.0) by default to prevent runaway scales. Weight decay **1e‑4** on S‑REG parameters adds gentle shrinkage. Attribution telemetry (share of residual magnitudes) is logged for all types and bands to support freezing/pruning decisions.
+
+### 11.6 S‑REG training schedule and freeze
+
+* **Initial freeze:** S‑REG parameters remain **frozen for the first 2% of tokens** to allow H‑Net and HRM anchors to settle.
+* **Learning rate:** S‑REG optimizer group uses an **LR multiplier of 0.5** relative to the trunk default with **weight decay 1e‑4** and a soft barrier (s\le s_{\max}) (default (s_{\max}=2.0)).
+* **Unfreeze & train:** after the freeze window, S‑REG trains continuously; attribution histograms are logged each epoch to support freezing/pruning (§6.5).
+* **Debug guard:** a compile‑time flag can zero specific type scales for sanity checks; production runs keep all scales enabled.
 
 ---
 
@@ -2015,6 +2142,16 @@ During M5, rising `s_type.ffn_retrieve` should correlate with decreasing adapter
 
 **Verify-path neutrality.**
 S-REG must not change the rate of **verify_bump** requests unrelated to confidence/innovation triggers. Track verify usage stratified by `s_type.*` deciles; differences >10% absolute trigger investigation.
+
+### 12.1 S‑REG attribution quotient monitor
+
+Track a simple **attribution quotient** during fixed→routed handover within a time window:
+
+[
+\text{share}(\Delta_{\text{fixed}}) ;+; \text{share}(\Delta_{\text{routed}}) ;\approx; 1 ;(\pm \varepsilon).
+]
+
+Page an alert on persistent deviation; this indicates leakage or mis‑attribution during anneal.
 
 ---
 
@@ -2126,19 +2263,60 @@ The THPL `mode_flags` determine the behavior:
 
 Training uses a coverage-controlled selective risk objective to calibrate the head.
 
-### 14.3 The Verify Path and Quality-of-Life Improvements
+#### 14.2.1 Entity‑risk routing policy (tightened; verify‑first)
 
-When confidence is low, the verify path executes compile-safe checks:
+Selective confidence escalates to verify when the **entity‑risk head** and off‑manifold signals agree:
 
-+1 Outer Step: run one additional HRM outer step, respecting THPL caps.
+**Condition (per span):**
+[
+(\textsf{entity_risk} \ge \tau_{\text{risk}})\ \wedge
+\Big( \ \textsf{proto_dist} \ge \tau_{\text{proto}} \ \ \ \lor\ \ \ \textsf{adapter_OOD} \ge \tau_{\text{ood}} \ \Big)
+]
 
-Attention Bump: temporarily increase attention capacity in designated trunk layers (e.g., larger DSA K), stepping up in powers of two up to verify_bump_max_k (see §7.1.1, §10.1.4).
+* **Signals.**
 
-Rare Top-2 FFN: evaluate the runner-up FFN cluster only if a prototype two-shot check (cosine) suggests disagreement; try the expert value cache before a full second MLP.
+  * `entity_risk`: token‑level risk from the entity‑risk head (names, dates, IDs).
+  * `proto_dist`: cosine distance of (q=hG') to the nearest FFN‑cluster prototype (stop‑grad).
+  * `adapter_OOD`: Mahalanobis distance of adapter inputs from calibration stats.
+* **Default thresholds (per domain; THPL‑configurable).**
 
-Span Bunching: merge adjacent flagged tokens (e.g., max_gap_tokens: 8) into one span to run a single verify pass.
+  * General text: (\tau_{\text{risk}}=0.60,\ \tau_{\text{proto}}=0.35,\ \tau_{\text{ood}}=0.85)
+  * Code/doc QA (stricter abstain): (\tau_{\text{risk}}=0.55,\ \tau_{\text{proto}}=0.30,\ \tau_{\text{ood}}=0.80)
+* **Action.** Route the span to the **verify path** (one extra outer step, attention **verify‑bump**, cache‑first, then rare top‑2 FFN if enabled). If `mode=verify_only`, do **not** abstain; otherwise, allow abstention only **after** verification if confidence remains below the abstain threshold.
+* **Budget & guards.** Span bunching (max_gap_tokens=8) reduces overhead. Verify path budgets remain: average <5% and p95 ≤15% on flagged spans. Thresholds may be decayed slightly for high‑harm entity classes (e.g., medical/legal) via THPL presets while maintaining compile‑safe invariants.
 
-Latency budgets: average <5% overhead; p95 ≤15% on flagged spans (see §12).
+### 14.3 The verify path & QoL improvements (shape‑stable parallelism)
+
+When sequence‑level confidence is low, the verify path executes compile‑safe steps:
+
+* **+1 outer step** (policy‑capped).
+* **Attention bump:** escalate global reach in designated layers (e.g., DSA (K)) in power‑of‑two steps up to **verify_bump_max_k** (pre‑warmed buckets only).
+* **Parallel top‑2 FFN (verify‑only):** inside verify, evaluate the runner‑up FFN expert **in parallel** with the top‑1 expert using **pre‑allocated k=2 buffers/kernels** owned by the verify module. This is shape‑stable and never changes the main forward’s top‑1 invariant. A prototype two‑shot cosine check can short‑circuit the full second expert; **always try the value cache first**.
+* **Span bunching:** merge adjacent flagged tokens (max_gap_tokens = 8) to run a single verify pass on the span.
+
+**Budgets & guards:** overall average overhead <5%; p95 ≤15% on flagged spans; rare top‑2 FFN trigger rate <3% of tokens with ≥60% win‑rate. If p95 exceeds 15% for two consecutive eval windows, auto‑disable span bunching and revert to a stricter cache‑first policy until tails recover.
+
+#### 14.3.1 Rare top‑2 FFN (verify‑only) — **parallel compute** semantics
+
+When the verify path is active and **policy.ffn_verify_k = 2**, the runner‑up FFN expert (**same family→cluster tier**) is evaluated **in parallel** with the top‑1 expert **inside the verify module only**.
+
+**Semantics & invariants.**
+
+* **Parallel evaluation:** both experts run concurrently using **pre‑allocated k=2 buffers**; the better output (lower loss proxy or higher agreement with cache/teacher) is selected by a fixed reducer.
+* **Shape‑stable:** compile warm‑up pre‑traces the k=2 path; the main forward remains **top‑1** elsewhere.
+* **Cache‑first:** if the value cache approximates the runner‑up within the current error budget, the cache result is used and the second MLP is skipped.
+* **Budgets:** trigger rate <3% tokens; win‑rate ≥60%; p95 latency on flagged spans ≤15%.
+
+**Config (concise).**
+
+```yaml
+verify_path:
+  ffn:
+    policy_ffn_verify_k: 2          # verify-only; main path remains k=1
+    reducer: "min_loss_proxy"        # tie-break by cache agreement, then entropy
+    preallocate_k2_buffers: true
+    cache_first: true
+```
 
 ### 14.4 Uncertainty-Coupled Attention Controls
 
@@ -2240,22 +2418,47 @@ moirai/
     eval_bench.py
 ```
 
-### 15.2 Immediate Engineering Tasks
+### 15.2 Immediate engineering tasks
 
-This list represents the core engineering tickets to be implemented.
+1. **Router API.** Family→cluster→expert router with MoR; HRM cluster router with compute priors; tier‑level Expert‑Choice fallback.
+2. **H‑Net.** Boundary heads, soft pooling, reverse lattice, target‑bits curriculum, ratio/entropy regularizers, block‑sparse masks.
+3. **HRM loops.** Exact L/M/G step order; residual expert wrapping; FiLM broadcast (grouped option).
+4. **HRM experts.** Heterogeneous sizes, per‑expert adapters, shared fixed HRM paths with per‑cluster gates, size curricula controllers.
+5. **FFN transplant kit.** Calibration stats; gate‑compensation; fixed FFN constructor; family adapters; donor LN handling; alignment loss.
+6. **Halter module.** ACT and BCE halters; cosine veto hook; convergence regularizer and one‑step gradient toggles (THPL‑gated).
+7. **Expert value cache.** Per‑cluster low‑rank surrogate with EMA updates; tie to repurposed fixed expert; error/hit‑rate guards.
+8. **Compile harness.** Enforce static top‑k=1 dispatch; manage re‑compiles at allowed phase boundaries (FFN 1→2 clusters; M5‑LC long‑context enable).
+9. **Attention backends.** Per‑layer registry; SDPA/windowed/dilated, AFA, GA, SSA, Sigmoid, DSA, Power; SILM coupling to DSA; precision hygiene.
+10. **THPL.** 64‑byte header builder, parser, presets, Canonical Byte Policy.
+11. **Selective confidence.** Abstain head, entity‑risk probe, verify path (span bunching, prototype two‑shot, verify‑bump K escalation).
+12. **Warm‑up driver.** Pre‑trace all expert shapes, DSA K buckets (up to verify_bump_max_k), THPL presets, and verify triggers; include **dual‑exec heads** for the limited mixer (§7.7).
+13. **HP search & logging.** Integrate **Optuna/Ray Tune** for key knobs (SSA bounds, GA regularization, S‑REG (s_{\max}), loop caps); adopt **SwanLab** for lightweight metrics and artifacts.
+14. **Project plumbing.** Use **uv** and **pyproject.toml** for reproducible builds, lockfiles, and environment bootstrap.
 
-1.  **Router API:** Implement the family→cluster→expert router with MoR at the cluster level; the HRM cluster router with compute prior κ; and the tier-level Expert-Choice fallback mechanism.
-2.  **H-Net Module:** Implement boundary heads, soft pooling, the reverse lattice for reconstruction, the target-bits curriculum, ratio/entropy regularizers, and block-sparse attention masks.
-3.  **HRM Loops:** Implement the exact order of operations for L/M/G steps, including residual expert wrapping and the FiLM broadcast mechanism (with grouped option).
-4.  **HRM Experts:** Implement heterogeneous expert sizes, per-expert adapters, shared fixed HRM paths with per-cluster scalar gates, and the size curricula controllers.
-5.  **FFN Transplant Kit:** Build the pipeline for calibration stats, the gate-compensation builder, the fixed FFN constructor, shared family adapters, donor LN copying, and the alignment loss.
-6.  **Halter Module:** Implement the 2-layer MLP halter with ACT, the BCE halter, the cosine veto hook, and the toggles for convergence regularization and one-step gradients, all gated by the THPL `Policy`.
-7.  **Expert Value Cache:** Implement the per-FFN-cluster low-rank surrogate with EMA updates for faster retrieval.
-8.  **Compile Harness:** Ensure all components adhere to static k=1 and tensorized dispatch; manage re-compilation only at designated phase boundaries (e.g., FFN 1→2 cluster schedule).
-9.  **Attention Backends:** Implement the per-layer registry and the various optional backends (AFA, GA, SSA, Sigmoid, DSA, Power) and stability knobs (SILM, Logit Hygiene).
-10. **Policy Layer (THPL):** Implement the THPL header builder, parser, presets, and the Canonical Byte Policy for data preprocessing.
-11. **Selective Confidence:** Implement the selective abstain head, the entity-risk probe, and the full verify path logic.
-12. **Warm-up Driver:** Create the "path exciter" script to pre-compile all expected graph variants before training begins.
+### 15.3 Hyperparameter search & experiment logging (Optuna + SwanLab)
+
+**Objective.** Automate critical knob selection with **Optuna** (or Ray Tune backend) and ensure experiment hygiene with **SwanLab** logging. Reproducibility is enforced via **uv** and **pyproject.toml**.
+
+**Search spaces (examples).**
+
+* **SSA temperature bounds:** `min_tau ∈ [0.5,0.8]`, `max_tau ∈ [1.2,1.6]`.
+* **GA regularization:** `l1_on_gate ∈ [5e-5, 5e-4]`, `gate_floor ∈ [0.01,0.05]`.
+* **S‑REG barrier:** `s_max ∈ [1.6, 2.2]`, `λ_barrier ∈ [5e-4, 2e-3]`.
+* **Loop caps (policy):** `outer_max ∈ {6,8,12,16}`, `l_max ∈ {2,3,4}`, `m_max ∈ {1,2}`.
+* **Verify budgets:** `verify_bump_max_k ∈ {2048,4096}`, `max_gap_tokens ∈ {4,8,12}`.
+* **FFN cache tolerance:** `rel_L2_target ∈ {0.01,0.02}`, with hit‑rate guard thresholds.
+
+**Study protocol.**
+
+* **Samplers/Pruners:** TPE sampler, median‑stopping pruner; budget small runs to 10–25 trials per milestone‑critical knob set.
+* **Metrics:** primary (PPL or task metric), latency p50/p95, VRAM, stability flags (NaNs/overflow), and coverage deltas (verify/abstain).
+* **Constraints:** enforce compile‑warmed paths; abort trial if it requests unsupported K‑buckets or backends.
+* **Artifacts:** store THPL presets, exact config YAML, compile warm‑up coverage, and seed in SwanLab; attach git commit hash and study ID.
+
+**Repro & plumbing.**
+
+* Environments are resolved via **uv**; the `pyproject.toml` lock ensures identical wheels across trials.
+* Each study run exports a **manifest** (config+warm‑up coverage+study ID) to allow byte‑for‑byte regeneration of the best trial.
 
 ---
 
@@ -2443,7 +2646,7 @@ attention:
     tau: {min: 0.5, max: 2.0, init_bias: 0.0}
     value_scale: {enable: false}
   gated_attention:
-    enable: {hrm_l: true, hrm_m: false, hnet_v0: false}
+    enable: {hrm_l: true, hrm_m: true}   # GA mandated on both L and M
     granularity: "head"
     condition: "query"
     init: {bias: -1.5, w_std: 0.02}
@@ -2719,15 +2922,17 @@ training:
 
 ## 17) Token & compute budgets
 
-* **MoirAI‑Q0.5B**
-  * Active parameters per token (with hetero HRM): **≈ 300–380 M**
-  * Feasible pretraining: **~4–7 B tokens** in ≤ ~2 weeks on a **Radeon 7900 XTX** class GPU with checkpointing.
+* **MoirAI‑0.9B‑A0.3B**
 
-* **MoirAI‑Q1.5B**
-  * Active parameters per token: **≈ 820–900 M**
-  * Feasible pretraining: **~2–4 B tokens** at similar walltime (thanks to transplanted FFN knowledge).
+  * **Avg active parameters / token:** **≈ 0.30–0.38B**
+  * **Feasible pretraining:** **~4–7B tokens** on a single high‑end consumer GPU with checkpointing and truncated BPTT.
 
-**Why it matters.** These budgets calibrate milestone durations, router capacity factors, and the ESE/DSA/Power mix chosen at **M5‑LC** so latency and VRAM stay inside plan.
+* **MoirAI‑2.9B‑A0.9B**
+
+  * **Avg active parameters / token:** **≈ 0.82–0.90B**
+  * **Feasible pretraining:** **~2–4B tokens** at similar wall‑time due to donor FFN knowledge and efficient routing.
+
+These budgets guide router capacity factors, verify‑path ceilings, and long‑context backend choices so latency and VRAM remain within target envelopes.
 
 ---
 
@@ -2769,32 +2974,109 @@ Freeze everything but the target band; then unfreeze normally after the shield.
 * **Verify‑only mode:** Must **never** abstain; verify path only.
 * **Immutable registry:** After compile warm‑up at M5‑LC, per‑layer backends are frozen.
 
+#### 18.5 Ablation checklist (controversial knobs)
+
+**Backends & long‑context**
+
+* **SILM** on trunk dotprod/DSA: length‑generalization (≥16×), DSA top‑K recall, NaNs.
+* **Rotary 25% vs hybrid 3/1 RoPE/NoPE**: equal compute, long‑context loss delta, stability.
+* **Limited dynamic mixer (head‑scoped)**: Δ step‑time (≤5%), entropy of mixing (near‑binary), domain‑wise gains.
+
+**Verify & selective confidence**
+
+* **Verify top‑2 FFN (verify‑only)**: p95 on flagged spans vs sequential top‑2, cache hit‑rate, trigger rate <3% tokens, win‑rate ≥60%.
+* **Span bunching**: latency tails vs coverage.
+
+**H‑Net & chunking**
+
+* **Re‑chunk on demand**: p95/p99 tails, first‑byte error reduction, trigger budget compliance.
+* **FBA on/off (text)**: first‑byte boundary errors, global perplexity ≤0.1% drift.
+
+**HRM & experts**
+
+* **GA on HRM‑M**: sink metrics, training loss variance, latency impact.
+* **HRM‑L micro‑experts**: local pick‑rates, outer‑step reductions, net step‑time (Δ≤5%).
+* **Repurpose vs removal of fixed paths**: dev deltas ≤0.5% abs; cache fidelity when repurposed anchors are used.
+* **Partial re‑init schedule vs diversity tier**: (L_{\text{align}}) trend, perplexity vs step‑time; choose safer route for milestone freeze.
+
+**Residual & precision**
+
+* **Learned convex aggregator vs hard add**: convergence speed and stability; no regression on variance metrics.
+* **Precision fallback (bf16 scopes)**: stability vs throughput; document per‑module exceptions; maintain QK‑Norm and logit hygiene.
+
+**Reasoning**
+
+* **Reasoning traces during SFT**: effect on multi‑step puzzles and long‑horizon NL tasks; ensure no leakage into generated text.
+* **MTP head**: quality/latency trade‑off at small (m); disable if cost outweighs gains.
+
+Each ablation specifies: datasets/slices, compute equalization, primary metric(s), latency/VRAM budget, acceptance thresholds, and roll‑forward criteria.
+
 ---
 
 ## References
 
-[^1]: **H-Net: Hierarchical Tokenization from Raw Bytes.** arXiv:2507.07955. [https://arxiv.org/abs/2507.07955](https://arxiv.org/abs/2507.07955)
-[^2]: **H-Net, Past & “Attention as a Primitive.”** GoombaLab blog (2025). [https://goombalab.github.io/blog/2025/hnet-past/#attention-as-a-primitive](https://goombalab.github.io/blog/2025/hnet-past/#attention-as-a-primitive)
+[^1]: **H‑Net: Hierarchical Tokenization from Raw Bytes.** arXiv:2507.07955. [https://arxiv.org/abs/2507.07955](https://arxiv.org/abs/2507.07955)
+
+[^2]: **H‑Net, Past & “Attention as a Primitive.”** GoombaLab blog (2025). [https://goombalab.github.io/blog/2025/hnet-past/#attention-as-a-primitive](https://goombalab.github.io/blog/2025/hnet-past/#attention-as-a-primitive)
+
 [^3]: **Hierarchical Reasoning Model (HRM).** arXiv:2506.21734. [https://arxiv.org/abs/2506.21734](https://arxiv.org/abs/2506.21734)
+
 [^4]: **HRM Code.** sapientinc/HRM (GitHub). [https://github.com/sapientinc/HRM](https://github.com/sapientinc/HRM)
-[^5]: **CMoE: Converting Mixture-of-Experts from Dense to MoEs (training-free).** arXiv:2502.04416. [https://arxiv.org/abs/2502.04416](https://arxiv.org/abs/2502.04416)
+
+[^5]: **CMoE: Converting Mixture‑of‑Experts from Dense to MoEs (training‑free).** arXiv:2502.04416. [https://arxiv.org/abs/2502.04416](https://arxiv.org/abs/2502.04416)
+
 [^6]: **Generalized MoEfication for Dense Pretrained Models.** EMNLP 2024. [https://aclanthology.org/2024.emnlp-main.563.pdf](https://aclanthology.org/2024.emnlp-main.563.pdf)
-[^7]: **HC-SMoE: Retraining-Free Merging of Sparse MoE via Hierarchical Clustering.** arXiv:2410.08589. [https://arxiv.org/abs/2410.08589](https://arxiv.org/abs/2410.08589)
+
+[^7]: **HC‑SMoE: Retraining‑Free Merging of Sparse MoE via Hierarchical Clustering.** arXiv:2410.08589. [https://arxiv.org/abs/2410.08589](https://arxiv.org/abs/2410.08589)
+
 [^8]: **UMoE: Unified/Universal MoE.** arXiv:2505.07260. [https://arxiv.org/abs/2505.07260](https://arxiv.org/abs/2505.07260)
-[^9]: **SILM: Scale-Invariant Logit Modulation.** arXiv:2505.17083. [https://arxiv.org/abs/2505.17083](https://arxiv.org/abs/2505.17083)
-[^10]: **Selective Self-Attention.** arXiv:2411.12892. [https://arxiv.org/abs/2411.12892](https://arxiv.org/abs/2411.12892)
-[^11]: **Confidence-Aware Selective Generation (abstention/verification).** arXiv:2509.03531. [https://arxiv.org/abs/2509.03531](https://arxiv.org/abs/2509.03531)
-[^12]: **CompLLM: Semantic Compression with LLMs (segment→embedding).** arXiv:2304.12512 (companion to our ESE idea). [https://arxiv.org/abs/2304.12512](https://arxiv.org/abs/2304.12512)
-[^13]: **Qwen3-Next (architecture & RoPE/NoPE mixing notes).** Qwen blog (2025). [https://qwen.ai/blog?id=4074cca80393150c248e508aa62983f9cb7d27cd](https://qwen.ai/blog?id=4074cca80393150c248e508aa62983f9cb7d27cd)
-[^14]: **Qwen2/2.5 Technical Details (dims/sizes).** Qwen3 post & model docs. [https://qwenlm.github.io/blog/qwen3/](https://qwenlm.github.io/blog/qwen3/)
-[^15]: **Qwen Key Concepts / Model Specs (dims).** Qwen site. [https://qwen.ai/research](https://qwen.ai/research)
-[^16]: **H-Net Router: Practical Notes.** declan.dev note. [https://www.deklan.dev/hnet-router](https://www.deklan.dev/hnet-router)
-[^17]: **H-Net Intuitions Gallery.** [https://main-horse.github.io/hnet/intuitions/](https://main-horse.github.io/hnet/intuitions/)
-[^18]: **DeepSeek V3.2 – Dynamic Sparse Attention (DSA).** Technical report (user-provided PDF; internal)
+
+[^9]: **SILM: Scale‑Invariant Logit Modulation.** arXiv:2505.17083. [https://arxiv.org/abs/2505.17083](https://arxiv.org/abs/2505.17083)
+
+[^10]: **Selective Self‑Attention.** arXiv:2411.12892. [https://arxiv.org/abs/2411.12892](https://arxiv.org/abs/2411.12892)
+
+[^11]: **Confidence‑Aware Selective Generation (abstention/verification).** arXiv:2509.03531. [https://arxiv.org/abs/2509.03531](https://arxiv.org/abs/2509.03531)
+
+[^12]: **CompLLM: Semantic Compression with LLMs (segment→embedding).** arXiv:2304.12512. [https://arxiv.org/abs/2304.12512](https://arxiv.org/abs/2304.12512)
+
+[^13]: **Qwen3‑Next (architecture & RoPE/NoPE mixing notes).** Qwen blog (2025). [https://qwen.ai/blog?id=4074cca80393150c248e508aa62983f9cb7d27cd](https://qwen.ai/blog?id=4074cca80393150c248e508aa62983f9cb7d27cd)
+
+[^14]: **Qwen2/2.5 Technical Details (dims/sizes).** Qwen3 docs. [https://qwenlm.github.io/blog/qwen3/](https://qwenlm.github.io/blog/qwen3/)
+
+[^15]: **Qwen Key Concepts / Model Specs.** Qwen site. [https://qwen.ai/research](https://qwen.ai/research)
+
+[^16]: **H‑Net Router: Practical Notes.** declan.dev. [https://www.deklan.dev/hnet-router](https://www.deklan.dev/hnet-router)
+
+[^17]: **H‑Net Intuitions Gallery.** [https://main-horse.github.io/hnet/intuitions/](https://main-horse.github.io/hnet/intuitions/)
+
+[^18]: **DeepSeek V3.2 – Dynamic Sparse Attention (DSA).** Technical report (internal).
+
 [^19]: **Power Attention: Scaling Context Requires Rethinking Attention.** arXiv:2507.04239. [https://arxiv.org/abs/2507.04239](https://arxiv.org/abs/2507.04239)
-[^20]: **Attention Sink & Activation Outliers (mitigation context).** ICLR 2025. [https://openreview.net/forum?id=78Nn4QJTEN](https://openreview.net/forum?id=78Nn4QJTEN)
+
+[^20]: **Attention Sink & Activation Outliers.** ICLR 2025. [https://openreview.net/forum?id=78Nn4QJTEN](https://openreview.net/forum?id=78Nn4QJTEN)
+
 [^21]: **Quantizable Transformers: Clipped Softmax & Gated Attention.** arXiv:2306.12929. [https://arxiv.org/abs/2306.12929](https://arxiv.org/abs/2306.12929)
-[^22]: **Outlier Suppression for Low-bit LMs.** arXiv:2209.13325. [https://arxiv.org/abs/2209.13325](https://arxiv.org/abs/2209.13325)
+
+[^22]: **Outlier Suppression for Low‑bit LMs.** arXiv:2209.13325. [https://arxiv.org/abs/2209.13325](https://arxiv.org/abs/2209.13325)
+
 [^23]: **LayerNorm’s Role in Attention Expressivity.** arXiv:2305.02582. [https://arxiv.org/abs/2305.02582](https://arxiv.org/abs/2305.02582)
-[^24]: **TRM vs HRM (generalization under tiny nets).** alphaXiv 2510.04871 (summary hub). [https://www.emergentmind.com/papers/2510.04871](https://www.emergentmind.com/papers/2510.04871)
-[^25]: **Gated Attention for Large Language Models: Non‑linearity, Sparsity, and Attention‑Sink‑Free.** arXiv:2505.06708 [https://arxiv.org/abs/2505.06708](https://arxiv.org/abs/2505.06708)
+
+[^24]: **TRM vs HRM (generalization under tiny nets).** alphaXiv 2510.04871. [https://www.emergentmind.com/papers/2510.04871](https://www.emergentmind.com/papers/2510.04871)
+
+[^25]: **Gated Attention for Large Language Models.** arXiv:2505.06708. [https://arxiv.org/abs/2505.06708](https://arxiv.org/abs/2505.06708)
+
+[^26]: **Modded NanoGPT Speedrun.** GitHub: KellerJordan/modded‑nanogpt. [https://github.com/KellerJordan/modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt)
+
+[^27]: **ES Fine‑tuning.** arXiv:2509.24372v1; GitHub: VsonicV/es‑fine‑tuning‑paper. [https://arxiv.org/abs/2509.24372](https://arxiv.org/abs/2509.24372), [https://github.com/VsonicV/es-fine-tuning-paper](https://github.com/VsonicV/es-fine-tuning-paper)
+
+[^28]: **Halting head inference logit threshold (discussion).** X/Twitter @ritteradam. [https://x.com/ritteradam/status/1983291492685824352](https://x.com/ritteradam/status/1983291492685824352)
+
+[^29]: **Reasoning data during SFT (Synergy).** NVIDIA Research. [https://research.nvidia.com/labs/adlr/Synergy/](https://research.nvidia.com/labs/adlr/Synergy/)
+
+[^30]: **Train with ≤16 outer steps; allow longer at inference (practice).** X/Twitter @huskydogewoof. [https://x.com/huskydogewoof/status/1982503109042831472](https://x.com/huskydogewoof/status/1982503109042831472)
+
+[^31]: **BPTT on full final outer step; training lessons (TRM talk).** YouTube. [https://youtu.be/ETukUNsn_wQ](https://youtu.be/ETukUNsn_wQ)
+
+[^32]: **Using fp16 over bf16 (trade‑offs & evidence).** arXiv:2510.26788. [https://arxiv.org/abs/2510.26788](https://arxiv.org/abs/2510.26788)
+
+[^33]: **PyTorch AMP — Gradient scaling.** Docs. [https://docs.pytorch.org/docs/stable/amp.html#gradient-scaling](https://docs.pytorch.org/docs/stable/amp.html#gradient-scaling)
