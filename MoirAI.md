@@ -450,13 +450,13 @@ The model iterates outer steps until the halter stops or policy caps are reached
 * **Train vs inference caps:** training **outer_max ≤16**; inference may allow higher, per policy.
 * **Gradients:** default **truncated BPTT across outer steps** (full gradients across inner L/M loops of the final step).
 
-**Inference halting bias** [^28] — THPL can set:
+**Inference halting bias** — THPL can set:
 
 ```yaml
 policy.halt_offset: +5.0   # default 0.0; clipped to +7.5
 ```
 
-**Mixed‑BPTT sprinkles** [^31] — with small probabilities, enable gradients through the first or first+second outer steps, run a backward pass, clear gradients, then run the final step and backward. Activation checkpointing and OOM‑based auto‑throttling are required.
+**Mixed‑BPTT sprinkles** — with small probabilities, enable gradients through the first or first+second outer steps, run a backward pass, clear gradients, then run the final step and backward. Activation checkpointing and OOM‑based auto‑throttling are required.
 
 #### 5.4.1 Inference halting bias (logit offset) [^28]
 
@@ -1247,7 +1247,7 @@ For very long documents, we replace raw byte ingestion with ESE. A small externa
 
 As an alternative to DSA, **Power Attention** provides linear-cost global mixing with a tunable state size `m`. Our **per-layer registry** allows us to assign different backends (`dotprod`, `power`, `dsa`) to different trunk layers at initialization, enabling a hybrid approach. For example, some layers can be `power` while others are `dsa`.
 
-#### 7.3.3 Hybrid Positional Encoding (Trunk) [^13]
+#### 7.3.3 Hybrid Positional Encoding (Trunk)
 
 For better long-context extrapolation, trunk layers can use a hybrid positional encoding scheme: a repeating pattern of 3 layers with RoPE and 1 layer with NoPE, with QK-Norm applied to all trunk layers for stability.
 
@@ -1531,7 +1531,7 @@ When `policy.answer_head == "puzzle_fixed"`, a specialized head is used instead 
 
 A sequence-mixing MLP expert is included in the HRM-L expert bank but is only **eligible** for routing when `policy.seq_mlp_allowed == true`. This provides specialized capacity for grid-like tasks (Sudoku, ARC) without affecting general-purpose ones.
 
-### 9.4 HRM control: EMA, loop‑cap auto‑tuning, and inference bias [^28]
+### 9.4 HRM control: EMA, loop‑cap auto‑tuning, and inference bias
 
 **EMA.** Evaluate HRM L/M/G (and their routers/adapters) with EMA weights; trunk attention and FFN bank use raw weights.
 
@@ -1955,7 +1955,7 @@ Both are shape-stable and preallocated.
 
 Note: M6 and M7 are defined once in §10 (above); no additional milestone definitions appear here.
 
-#### 10.2.4 Reasoning traces during SFT (optional) [^29]
+#### 10.2.4 Reasoning traces during SFT (optional)
 
 When datasets provide latent reasoning signals, add a small auxiliary loss (0.05–0.10) that encourages (hG_t) (and optional pooled L/M states) to match provided intermediate embeddings at each outer step. This supervision is **latent‑only** and does not alter generated text.
 
